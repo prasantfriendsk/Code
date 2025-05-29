@@ -1,0 +1,67 @@
+# Export-GitHubTeamMembers.ps1
+
+# ======= CONFIGURATION =======
+$token = "your_github_token_here"
+$org = "your_org_name_here"
+$outputCsv = "GitHub_Team_Members.csv"
+
+# ======= HEADERS =======
+$headers = @{
+    Authorization = "token $token"
+    Accept        = "application/vnd.github.v3+json"
+}
+
+# ======= PAGINATION HELPER FUNCTION =======
+function Get-GitHubPagedResults($baseUrl, $headers) {
+    $results = @()
+    $page = 1
+
+    do {
+        $pagedUrl = "$baseUrl?page=$page&per_page=100"
+        try {
+            $response = Invoke-RestMethod -Uri $pagedUrl -Headers $headers
+            if ($response.Count -gt 0) {
+                $results += $response
+            }
+            $page++
+        } catch {
+            Write-Host "⚠️ Failed to fetch page $page for $baseUrl" -ForegroundColor Red
+            break
+        }
+    } while ($response.Count -eq 100)
+
+    return $results
+}
+
+# ======= GET ALL TEAMS =======
+Write-Host "🔍 Fetching all teams in organization '$org'..." -ForegroundColor Cyan
+$teamsUrl = "https://api.github.com/orgs/$org/teams"
+$teams = Get-GitHubPagedResults -baseUrl $teamsUrl -headers $headers
+
+# ======= COLLECT TEAM MEMBERS =======
+$results = @()
+
+foreach ($team in $teams) {
+    $teamName = $team.name
+    $slug = $team.slug
+    Write-Host "`n🧑‍🤝‍🧑 Team: $teamName" -ForegroundColor Yellow
+
+    $membersUrl = "https://api.github.com/orgs/$org/teams/$slug/members"
+    $members = Get-GitHubPagedResults -baseUrl $membersUrl -headers $headers
+
+    foreach ($member in $members) {
+        $results += [PSCustomObject]@{
+            TeamName = $teamName
+            Member   = $member.login
+        }
+        Write-Host "  👤 $($member.login)"
+    }
+
+    if ($members.Count -eq 0) {
+        Write-Host "  ⚠️ No members found." -ForegroundColor DarkGray
+    }
+}
+
+# ======= EXPORT TO CSV =======
+$results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+Write-Host "`n✅ Export complete: $outputCsv" -ForegroundColor Green
