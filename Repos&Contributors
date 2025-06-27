@@ -1,0 +1,61 @@
+# Parameters
+$GitHubToken = "your-token-here"           # Replace with your GitHub personal access token
+$GitHubOrgOrUser = "github-username-or-org" # Replace with target GitHub username or organization
+$IsOrg = $true                             # Set to $false if it's a user, not an organization
+
+# Headers
+$Headers = @{
+    Authorization = "token $GitHubToken"
+    Accept        = "application/vnd.github+json"
+    "User-Agent"  = "PowerShellScript"
+}
+
+# Base URL
+$BaseUrl = if ($IsOrg) { "https://api.github.com/orgs/$GitHubOrgOrUser/repos" } else { "https://api.github.com/users/$GitHubOrgOrUser/repos" }
+
+# Get all repositories with pagination support
+$Page = 1
+$AllRepos = @()
+
+do {
+    $ReposResponse = Invoke-RestMethod -Uri "$BaseUrl?per_page=100&page=$Page" -Headers $Headers
+    if ($ReposResponse.Count -gt 0) {
+        $AllRepos += $ReposResponse
+        $Page++
+    } else {
+        break
+    }
+} while ($true)
+
+# Loop through each repository and get contributors
+$RepoContributors = @()
+
+foreach ($Repo in $AllRepos) {
+    Write-Host "Getting contributors for repo: $($Repo.name)"
+
+    $ContribUrl = $Repo.contributors_url
+    $ContribPage = 1
+    $AllContribs = @()
+
+    do {
+        $ContribResponse = Invoke-RestMethod -Uri "$ContribUrl?per_page=100&page=$ContribPage" -Headers $Headers
+        if ($ContribResponse.Count -gt 0) {
+            $AllContribs += $ContribResponse
+            $ContribPage++
+        } else {
+            break
+        }
+    } while ($true)
+
+    foreach ($Contributor in $AllContribs) {
+        $RepoContributors += [PSCustomObject]@{
+            Repository    = $Repo.name
+            Contributor   = $Contributor.login
+            Contributions = $Contributor.contributions
+        }
+    }
+}
+
+# Export to CSV
+$RepoContributors | Export-Csv -Path "GitHub_Repo_Contributors.csv" -NoTypeInformation
+Write-Host "Done! Exported to GitHub_Repo_Contributors.csv"
