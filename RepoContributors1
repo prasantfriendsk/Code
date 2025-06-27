@@ -1,46 +1,56 @@
-#!/bin/bash
+# ==== Configuration ====
+$GitHubUserOrOrg = "your-org-or-username"      # Set GitHub username or org
+$GitHubToken = "your-personal-access-token"    # GitHub PAT
+$IsOrg = $true                                  # $true = organization, $false = user
 
-# === Configuration ===
-GITHUB_USER_OR_ORG="your-username-or-org"  # Replace with GitHub username or organization
-GITHUB_TOKEN="your-token-here"             # Replace with your personal access token
-IS_ORG=true                                # true = organization, false = user
+# ==== Setup Base URL ====
+$BaseUrl = if ($IsOrg) {
+    "https://api.github.com/orgs/$GitHubUserOrOrg/repos"
+} else {
+    "https://api.github.com/users/$GitHubUserOrOrg/repos"
+}
 
-# === Derived URL ===
-if $IS_ORG; then
-  BASE_URL="https://api.github.com/orgs/$GITHUB_USER_OR_ORG/repos"
-else
-  BASE_URL="https://api.github.com/users/$GITHUB_USER_OR_ORG/repos"
-fi
+# ==== CSV Output ====
+$OutputFile = "GitHub_Repo_Contributors.csv"
+"Repository,Contributor,Contributions" | Out-File -Encoding UTF8 -FilePath $OutputFile
 
-# === Headers for Authorization ===
-AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
-ACCEPT_HEADER="Accept: application/vnd.github+json"
-UA_HEADER="User-Agent: curl-script"
+# ==== Headers ====
+$AuthHeader = "Authorization: token $GitHubToken"
+$AcceptHeader = "Accept: application/vnd.github+json"
+$UserAgent = "User-Agent: curl-powershell"
 
-# === Fetch Repositories (Paginated) ===
-echo "Repository,Contributor,Contributions" > github_repo_contributors.csv
-PAGE=1
+# ==== Get Repositories (Paginated) ====
+$Page = 1
+do {
+    Write-Host "Fetching repos - Page $Page"
 
-while : ; do
-  REPOS=$(curl -s -H "$AUTH_HEADER" -H "$ACCEPT_HEADER" -H "$UA_HEADER" "$BASE_URL?per_page=100&page=$PAGE")
-  COUNT=$(echo "$REPOS" | jq length)
-  [[ "$COUNT" -eq 0 ]] && break
+    $CurlCmd = "curl.exe -s -H `"$AuthHeader`" -H `"$AcceptHeader`" -H `"$UserAgent`" `"$BaseUrl?per_page=100&page=$Page`""
+    $RepoJson = Invoke-Expression $CurlCmd
+    $Repos = $RepoJson | ConvertFrom-Json
 
-  echo "$REPOS" | jq -r '.[] | .name + "," + .contributors_url' | while IFS=, read -r REPO_NAME CONTRIB_URL; do
-    echo "Processing $REPO_NAME..."
-    
-    C_PAGE=1
-    while : ; do
-      CONTRIBS=$(curl -s -H "$AUTH_HEADER" -H "$ACCEPT_HEADER" -H "$UA_HEADER" "$CONTRIB_URL?per_page=100&page=$C_PAGE")
-      C_COUNT=$(echo "$CONTRIBS" | jq length)
-      [[ "$C_COUNT" -eq 0 ]] && break
+    if (-not $Repos) { break }
 
-      echo "$CONTRIBS" | jq -r --arg repo "$REPO_NAME" '.[] | [$repo, .login, (.contributions|tostring)] | @csv' >> github_repo_contributors.csv
-      ((C_PAGE++))
-    done
-  done
+    foreach ($Repo in $Repos) {
+        $RepoName = $Repo.name
+        $ContribUrl = $Repo.contributors_url
+        Write-Host " → Getting contributors for repo: $RepoName"
 
-  ((PAGE++))
-done
+        $CPage = 1
+        do {
+            $CurlContrib = "curl.exe -s -H `"$AuthHeader`" -H `"$AcceptHeader`" -H `"$UserAgent`" `"$ContribUrl?per_page=100&page=$CPage`""
+            $ContribJson = Invoke-Expression $CurlContrib
+            $Contributors = $ContribJson | ConvertFrom-Json
 
-echo "✅ Done. Output saved to github_repo_contributors.csv"
+            if (-not $Contributors) { break }
+
+            foreach ($Contributor in $Contributors) {
+                "$RepoName,$($Contributor.login),$($Contributor.contributions)" | Out-File -Append -Encoding UTF8 -FilePath $OutputFile
+            }
+            $CPage++
+        } while ($true)
+    }
+
+    $Page++
+} while ($true)
+
+Write-Host "`n✅ Done! Output saved to: $OutputFile"
