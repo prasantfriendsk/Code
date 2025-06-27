@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# === Configuration ===
+GITHUB_USER_OR_ORG="your-username-or-org"  # Replace with GitHub username or organization
+GITHUB_TOKEN="your-token-here"             # Replace with your personal access token
+IS_ORG=true                                # true = organization, false = user
+
+# === Derived URL ===
+if $IS_ORG; then
+  BASE_URL="https://api.github.com/orgs/$GITHUB_USER_OR_ORG/repos"
+else
+  BASE_URL="https://api.github.com/users/$GITHUB_USER_OR_ORG/repos"
+fi
+
+# === Headers for Authorization ===
+AUTH_HEADER="Authorization: token $GITHUB_TOKEN"
+ACCEPT_HEADER="Accept: application/vnd.github+json"
+UA_HEADER="User-Agent: curl-script"
+
+# === Fetch Repositories (Paginated) ===
+echo "Repository,Contributor,Contributions" > github_repo_contributors.csv
+PAGE=1
+
+while : ; do
+  REPOS=$(curl -s -H "$AUTH_HEADER" -H "$ACCEPT_HEADER" -H "$UA_HEADER" "$BASE_URL?per_page=100&page=$PAGE")
+  COUNT=$(echo "$REPOS" | jq length)
+  [[ "$COUNT" -eq 0 ]] && break
+
+  echo "$REPOS" | jq -r '.[] | .name + "," + .contributors_url' | while IFS=, read -r REPO_NAME CONTRIB_URL; do
+    echo "Processing $REPO_NAME..."
+    
+    C_PAGE=1
+    while : ; do
+      CONTRIBS=$(curl -s -H "$AUTH_HEADER" -H "$ACCEPT_HEADER" -H "$UA_HEADER" "$CONTRIB_URL?per_page=100&page=$C_PAGE")
+      C_COUNT=$(echo "$CONTRIBS" | jq length)
+      [[ "$C_COUNT" -eq 0 ]] && break
+
+      echo "$CONTRIBS" | jq -r --arg repo "$REPO_NAME" '.[] | [$repo, .login, (.contributions|tostring)] | @csv' >> github_repo_contributors.csv
+      ((C_PAGE++))
+    done
+  done
+
+  ((PAGE++))
+done
+
+echo "✅ Done. Output saved to github_repo_contributors.csv"
