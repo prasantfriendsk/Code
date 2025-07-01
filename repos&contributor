@@ -1,24 +1,42 @@
-# Config
-$GitHubUser = "your-org-or-username"     # GitHub username or organization
-$Token = "ghp_xxxxxxxxxxxxxxxxxxxxxx"    # Optional: GitHub personal access token
-$Headers = @{ Authorization = "token $Token" }
+# ==== CONFIGURATION ====
+$GitHubUser = "your-org-or-username"     # Replace with GitHub org or user
+$IsOrg = $true                           # Set to $false if it's a user, not an org
+$Token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxx" # Optional: GitHub personal access token
+
+# ==== HEADERS & API BASE ====
+$Headers = if ($Token) { @{ Authorization = "token $Token" } } else { @{} }
 $ApiBase = "https://api.github.com"
-$ReposUrl = "$ApiBase/users/$GitHubUser/repos?per_page=100"
+$ReposBaseUrl = if ($IsOrg) { "$ApiBase/orgs/$GitHubUser/repos" } else { "$ApiBase/users/$GitHubUser/repos" }
 
-# Output CSV file
+# ==== PAGINATED REPO FETCH ====
+function Get-AllRepos {
+    $page = 1
+    $allRepos = @()
+
+    do {
+        $url = "$ReposBaseUrl?per_page=100&page=$page"
+        Write-Host "Fetching page $page: $url"
+        $response = Invoke-RestMethod -Uri $url -Headers $Headers -ErrorAction Stop
+        $allRepos += $response
+        $page++
+    } while ($response.Count -eq 100)
+
+    return $allRepos
+}
+
+# ==== MAIN SCRIPT ====
 $outputFile = "GitHubReposAndContributors.csv"
-@() | Export-Csv -Path $outputFile -NoTypeInformation
+@() | Export-Csv -Path $outputFile -NoTypeInformation  # Clear file
 
-# Get all repositories
-$repos = Invoke-RestMethod -Uri $ReposUrl -Headers $Headers
+$repos = Get-AllRepos
 
 foreach ($repo in $repos) {
     $repoName = $repo.name
-    $contributorsUrl = "$ApiBase/repos/$GitHubUser/$repoName/contributors"
+    $contributorsUrl = "$ApiBase/repos/$GitHubUser/$repoName/contributors?per_page=100"
+    Write-Host "Getting contributors for: $repoName"
 
     try {
-        $contributors = Invoke-RestMethod -Uri $contributorsUrl -Headers $Headers
-
+        $contributors = Invoke-RestMethod -Uri $contributorsUrl -Headers $Headers -ErrorAction Stop
         foreach ($contributor in $contributors) {
             [PSCustomObject]@{
                 Repository    = $repoName
@@ -31,4 +49,4 @@ foreach ($repo in $repos) {
     }
 }
 
-Write-Output "Done! Results saved to $outputFile"
+Write-Output "✅ Done! Output saved to: $outputFile"
