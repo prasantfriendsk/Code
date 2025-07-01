@@ -1,0 +1,34 @@
+# Config
+$GitHubUser = "your-org-or-username"     # GitHub username or organization
+$Token = "ghp_xxxxxxxxxxxxxxxxxxxxxx"    # Optional: GitHub personal access token
+$Headers = @{ Authorization = "token $Token" }
+$ApiBase = "https://api.github.com"
+$ReposUrl = "$ApiBase/users/$GitHubUser/repos?per_page=100"
+
+# Output CSV file
+$outputFile = "GitHubReposAndContributors.csv"
+@() | Export-Csv -Path $outputFile -NoTypeInformation
+
+# Get all repositories
+$repos = Invoke-RestMethod -Uri $ReposUrl -Headers $Headers
+
+foreach ($repo in $repos) {
+    $repoName = $repo.name
+    $contributorsUrl = "$ApiBase/repos/$GitHubUser/$repoName/contributors"
+
+    try {
+        $contributors = Invoke-RestMethod -Uri $contributorsUrl -Headers $Headers
+
+        foreach ($contributor in $contributors) {
+            [PSCustomObject]@{
+                Repository    = $repoName
+                Contributor   = $contributor.login
+                Contributions = $contributor.contributions
+            } | Export-Csv -Path $outputFile -Append -NoTypeInformation
+        }
+    } catch {
+        Write-Warning "Failed to get contributors for $repoName"
+    }
+}
+
+Write-Output "Done! Results saved to $outputFile"
