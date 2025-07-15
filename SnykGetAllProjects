@@ -1,0 +1,57 @@
+# Set your Snyk API Token and Org ID
+$apiToken = "<YOUR_SNYK_API_TOKEN>"
+$orgId = "<YOUR_ORG_ID>"
+$outputFile = "SnykVulnerabilityReport.csv"
+
+# Snyk API Base URL (REST API)
+$baseUrl = "https://api.snyk.io/rest"
+
+# Authorization headers
+$headers = @{
+    "Authorization" = "token $apiToken"
+    "Content-Type"  = "application/json"
+}
+
+# List to store results
+$allIssues = @()
+
+# Step 1: Fetch Projects
+Write-Host "Fetching projects..."
+$projectsUrl = "$baseUrl/orgs/$orgId/projects"
+$projectResponse = Invoke-RestMethod -Uri $projectsUrl -Headers $headers -Method Get
+$projects = $projectResponse.data
+
+foreach ($project in $projects) {
+    $projectName = $project.attributes.name
+    $projectId = $project.id
+    $projectUrl = "$baseUrl/orgs/$orgId/projects/$projectId/issues"
+
+    Write-Host "Fetching issues for project: $projectName"
+
+    try {
+        $issuesResponse = Invoke-RestMethod -Uri $projectUrl -Headers $headers -Method Get
+        $issues = $issuesResponse.data
+
+        foreach ($issue in $issues) {
+            $record = [PSCustomObject]@{
+                ProjectName = $projectName
+                IssueTitle  = $issue.attributes.title
+                Severity    = $issue.attributes.severity
+                IssueType   = $issue.attributes.issueType
+                CVE         = ($issue.attributes.identifiers.cve -join ", ")  # If any CVEs exist
+                Package     = $issue.attributes.package
+                IntroducedThrough = ($issue.attributes.introducedThrough -join ", ")
+            }
+
+            $allIssues += $record
+        }
+    } catch {
+        Write-Warning "Failed to fetch issues for project $projectName"
+    }
+}
+
+# Step 2: Export to CSV
+Write-Host "`nExporting report to $outputFile"
+$allIssues | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+
+Write-Host "✅ Report saved as '$outputFile'"
