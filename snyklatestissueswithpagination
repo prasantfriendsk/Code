@@ -1,0 +1,78 @@
+# Required Inputs
+$SnykToken = "YOUR_SNYK_API_TOKEN"
+$OrgId     = "YOUR_ORG_ID"
+$BaseUrl   = "https://api.snyk.io/v1/reporting"
+
+$Headers = @{
+  "Authorization" = "token $SnykToken"
+  "Content-Type"  = "application/json"
+}
+
+# Filters for the request
+$filters = @{
+  filters = @{
+    orgs     = @($OrgId)
+    severity = @("critical","high","medium","low")
+    types    = @("vuln","license","configuration")
+    patched  = $false
+    isFixed  = $false
+  }
+}
+
+# Paging setup
+$pageSize = 1000
+$pageNum = 1
+$allIssues = @()
+
+do {
+    $queryUrl = "$BaseUrl/issues/latest?perPage=$pageSize&page=$pageNum"
+    $bodyJson = $filters | ConvertTo-Json -Depth 10
+
+    Write-Host "Fetching page $pageNum..."
+    $response = Invoke-RestMethod -Method POST -Uri $queryUrl -Headers $Headers -Body $bodyJson
+
+    if ($response.issues) {
+        $allIssues += $response.issues
+        $issueCount = $response.issues.Count
+    } else {
+        $issueCount = 0
+    }
+
+    $pageNum++
+} while ($issueCount -eq $pageSize)
+
+Write-Host "Total issues retrieved: $($allIssues.Count)"
+
+# Transform into CSV format
+$csvData = $allIssues | ForEach-Object {
+    [PSCustomObject]@{
+        IssueId           = $_.issue.id
+        Title             = $_.issue.title
+        Type              = $_.issue.issueType
+        Severity          = $_.issue.severity
+        CVEs              = ($_.issue.identifiers.CVE -join ",")
+        CWEs              = ($_.issue.identifiers.CWE -join ",")
+        ExploitMaturity   = $_.issue.exploit.maturity
+        FixAvailable      = $_.issue.fixInfo.isUpgradable -or $_.issue.fixInfo.isPatchable -or $_.issue.fixInfo.isPinnable
+        FixedIn           = $_.issue.fixInfo.fixedInVersion
+        Package           = $_.issue.package
+        Version           = $_.issue.version
+        IntroducedThrough = ($_.introducedThrough -join ", ")
+        IntroducedDate    = $_.introducedDate
+        DisclosedDate     = $_.issue.disclosureTime
+        ProjectName       = $_.project.name
+        ProjectId         = $_.project.id
+        ProjectUrl        = $_.project.url
+        ProjectCreated    = $_.project.created
+        ProjectSource     = $_.project.source
+        ProjectTargetFile = $_.project.targetFile
+        IsPatched         = $_.isPatched
+        IsFixed           = $_.isFixed
+    }
+}
+
+# Export to CSV
+$csvPath = "snyk-latest-issues-full.csv"
+$csvData | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "`n✅ Exported full issue report to: $csvPath"
