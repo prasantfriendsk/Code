@@ -1,0 +1,65 @@
+# Prerequisites
+$SnykToken = "YOUR_SNYK_API_TOKEN"
+$OrgId     = "YOUR_ORG_ID"
+$BaseUrl   = "https://api.snyk.io/v1/reporting"
+
+$Headers = @{
+  "Authorization" = "token $SnykToken"
+  "Content-Type"  = "application/json"
+}
+
+# Fetch latest existing issues (as of ~9 hours ago)
+$latestBody = @{
+  filters = @{
+    orgs     = @($OrgId)
+    severity = @("critical","high","medium","low")
+    types    = @("vuln","license","configuration")
+    patched  = $false
+    isFixed  = $false
+  }
+} | ConvertTo-Json
+
+Write-Host "Calling /reporting/issues/latest..."
+$latestResponse = Invoke-RestMethod `
+  -Uri "$BaseUrl/issues/latest" `
+  -Method POST -Body $latestBody -Headers $Headers
+
+$latestResponse | ConvertTo-Json -Depth 6 | Out-File "snyk-latest-issues.json"
+Write-Host "Saved current issues to snyk-latest-issues.json"
+
+# Fetch historical issues for a date range
+$from = "2025-07-01"
+$to   = "2025-07-21"
+
+$issuesBody = @{
+  filters = @{
+    orgs     = @($OrgId)
+    severity = @("critical","high","medium","low")
+    types    = @("vuln","license","configuration")
+  }
+} | ConvertTo-Json
+
+Write-Host "Calling /reporting/issues from $from to $to..."
+$allIssues = Invoke-RestMethod `
+  -Uri "$BaseUrl/issues?from=$from&till=$to" `
+  -Method POST -Body $issuesBody -Headers $Headers
+
+$allIssues | ConvertTo-Json -Depth 6 | Out-File "snyk-issues-$from-to-$to.json"
+Write-Host "Saved historical issues to snyk-issues-$from-to-$to.json"
+
+# Example: Aggregate issue counts by day & severity
+$countsBody = @{
+  filters = @{
+    orgs     = @($OrgId)
+    severity = @("critical","high","medium","low")
+    types    = @("vuln")
+  }
+} | ConvertTo-Json
+
+Write-Host "Fetching daily issue counts..."
+$countsResponse = Invoke-RestMethod `
+  -Uri "$BaseUrl/counts/issues?from=$from&till=$to" `
+  -Method POST -Body $countsBody -Headers $Headers
+
+$countsResponse | ConvertTo-Json -Depth 6 | Out-File "snyk-issue-counts.json"
+Write-Host "Saved issue counts to snyk-issue-counts.json"
