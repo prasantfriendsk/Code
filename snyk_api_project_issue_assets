@@ -1,0 +1,82 @@
+# Variables (replace these with your values)
+$ApiKey = 'YOUR_SNYK_API_KEY'
+$OrgId = 'YOUR_ORG_ID'
+$BaseUrl = "https://api.snyk.io/rest"
+
+$Headers = @{
+    'Authorization' = "token $ApiKey"
+    'Content-Type'  = 'application/json'
+}
+
+# Step 1: Get Projects
+$projectsUri = "$BaseUrl/orgs/$OrgId/projects"
+$projectsResponse = Invoke-RestMethod -Uri $projectsUri -Headers $Headers -Method GET
+
+# Extract projectID and projectName
+$projectList = $projectsResponse.data | ForEach-Object {
+    [PSCustomObject]@{
+        projectId = $_.id
+        projectName = $_.attributes.name
+    }
+}
+
+# Initialize Arrays
+$issuesList = @()
+$depsList = @()
+$assetsList = @()
+
+# Loop through each project to get Issues, Dependencies, and Assets
+foreach ($project in $projectList) {
+    $projectId = $project.projectId
+
+    # Step 2: Get Issues for each project
+    $issuesUri = "$BaseUrl/orgs/$OrgId/projects/$projectId/issues"
+    $issuesResponse = Invoke-RestMethod -Uri $issuesUri -Headers $Headers -Method GET
+
+    foreach ($issue in $issuesResponse.data) {
+        $issuesList += [PSCustomObject]@{
+            projectId = $projectId
+            issueId = $issue.id
+            issueTitle = $issue.attributes.title
+            severity = $issue.attributes.severity
+        }
+    }
+
+    # Step 3: Get Dependencies for each project
+    $depsUri = "$BaseUrl/orgs/$OrgId/projects/$projectId/deps"
+    $depsResponse = Invoke-RestMethod -Uri $depsUri -Headers $Headers -Method GET
+
+    foreach ($dep in $depsResponse.data) {
+        $depsList += [PSCustomObject]@{
+            projectId = $projectId
+            depName = $dep.attributes.name
+            depVersion = $dep.attributes.version
+        }
+    }
+}
+
+# Step 4: Get Assets for each project
+$assetsUri = "$BaseUrl/orgs/$OrgId/projects/$projectId/assets"
+$assetsResponse = Invoke-RestMethod -Uri $assetsUri -Headers $Headers -Method GET
+
+foreach ($asset in $assetsResponse.data) {
+    $assetsList += [PSCustomObject]@{
+        projectId = $projectId
+        assetId = $asset.id
+        assetName = $asset.attributes.displayName
+        assetType = $asset.attributes.type
+    }
+}
+
+# Output results
+Write-Host "`n--- Projects ---`n"
+$projectList | Format-Table -AutoSize
+
+Write-Host "`n--- Issues ---`n"
+$issuesList | Format-Table -AutoSize
+
+Write-Host "`n--- Dependencies ---`n"
+$depsList | Format-Table -AutoSize
+
+Write-Host "`n--- Assets ---`n"
+$assetsList | Format-Table -AutoSize
