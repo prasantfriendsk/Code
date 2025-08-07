@@ -14,21 +14,13 @@ function Get-PaginatedData {
             $results += $response.data
             $page++
 
-            # Handle pagination using next.href or fallback
             if ($response.PSObject.Properties['links'] -and $response.links.next.href) {
                 $url = $response.links.next.href
             } elseif ($response.data.Count -eq $limit) {
-                # Fallback to manual pagination using starting_after
+                # Manual fallback to cursor pagination
                 $lastId = $response.data[-1].id
-                $baseUrl = $initialUrl -replace 'starting_after=.*?(&|$)', ''
-
-                if ($baseUrl -match '\?') {
-                    $join = "&"
-                } else {
-                    $join = "?"
-                }
-
-                $url = "$baseUrl$join" + "starting_after=$lastId&limit=$limit&version=$apiVersion"
+                $baseUrlOnly = $initialUrl -replace '\?.*$', ''
+                $url = "$baseUrlOnly?starting_after=$lastId&limit=$limit&version=$apiVersion"
             } else {
                 $url = $null
             }
