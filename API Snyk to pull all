@@ -6,12 +6,13 @@ $headers = @{
 }
 $apiVersion = "2024-03-19~beta"
 $baseUrl = "https://api.snyk.io/rest"
+$limit = 100  # Snyk API max page size
 
 # Output CSV path
 $outputPath = ".\snyk_projects_report.csv"
 $exportRows = @()
 
-# Function to handle paginated requests
+# Get paginated results with limit=100
 function Get-PaginatedData {
     param (
         [string]$url
@@ -20,34 +21,43 @@ function Get-PaginatedData {
     do {
         $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
         $results += $response.data
-        $url = $response.links.next.href
+        $url = if ($response.links.next.href) {
+            # Add API version back if missing in next URL
+            if ($url -notlike "*version=*") {
+                "$($response.links.next.href)?version=$apiVersion"
+            } else {
+                $response.links.next.href
+            }
+        } else {
+            $null
+        }
     } while ($url)
     return $results
 }
 
-# Get all projects with pagination
+# Get all projects
 function Get-AllProjects {
-    $url = "$baseUrl/orgs/$orgId/projects?version=$apiVersion"
+    $url = "$baseUrl/orgs/$orgId/projects?version=$apiVersion&limit=$limit"
     return Get-PaginatedData -url $url
 }
 
-# Get issues for a given project
+# Get project issues
 function Get-ProjectIssues {
     param([string]$projectId)
-    $url = "$baseUrl/orgs/$orgId/projects/$projectId/issues?version=$apiVersion"
+    $url = "$baseUrl/orgs/$orgId/projects/$projectId/issues?version=$apiVersion&limit=$limit"
     return Get-PaginatedData -url $url
 }
 
-# Get dependencies for a given project
+# Get project dependencies
 function Get-ProjectDependencies {
     param([string]$projectId)
-    $url = "$baseUrl/orgs/$orgId/projects/$projectId/dependencies?version=$apiVersion"
+    $url = "$baseUrl/orgs/$orgId/projects/$projectId/dependencies?version=$apiVersion&limit=$limit"
     return Get-PaginatedData -url $url
 }
 
-# Get all projects
+# Run
 $projects = Get-AllProjects
-Write-Host "`nFound $($projects.Count) projects.`n" -ForegroundColor Cyan
+Write-Host "`n📦 Found $($projects.Count) projects.`n" -ForegroundColor Cyan
 
 foreach ($project in $projects) {
     $projectId = $project.id
@@ -61,7 +71,7 @@ foreach ($project in $projects) {
     # Get issues
     $issues = Get-ProjectIssues -projectId $projectId
     if ($issues.Count -eq 0) {
-        # If no issues, still export the project row
+        # Export even if no issues
         $exportRows += [pscustomobject]@{
             ProjectName       = $projectName
             ProjectId         = $projectId
@@ -71,20 +81,21 @@ foreach ($project in $projects) {
             IssueIntroducedThrough = ""
             DependencyCount   = $dependencyCount
         }
-    }
-    foreach ($issue in $issues) {
-        $exportRows += [pscustomobject]@{
-            ProjectName       = $projectName
-            ProjectId         = $projectId
-            IssueTitle        = $issue.attributes.title
-            IssueSeverity     = $issue.attributes.severity
-            IssueType         = $issue.attributes.issueType
-            IssueIntroducedThrough = ($issue.attributes.introducedThrough -join ", ")
-            DependencyCount   = $dependencyCount
+    } else {
+        foreach ($issue in $issues) {
+            $exportRows += [pscustomobject]@{
+                ProjectName       = $projectName
+                ProjectId         = $projectId
+                IssueTitle        = $issue.attributes.title
+                IssueSeverity     = $issue.attributes.severity
+                IssueType         = $issue.attributes.issueType
+                IssueIntroducedThrough = ($issue.attributes.introducedThrough -join ", ")
+                DependencyCount   = $dependencyCount
+            }
         }
     }
 }
 
 # Export to CSV
 $exportRows | Export-Csv -Path $outputPath -NoTypeInformation -Encoding UTF8
-Write-Host "`n✅ Export complete: $outputPath`n" -ForegroundColor Green
+Write-Host "`n✅ CSV Export complete: $outputPath`n" -ForegroundColor Green
