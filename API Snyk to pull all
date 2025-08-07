@@ -1,0 +1,111 @@
+# === CONFIGURATION ===
+$apiToken = "YOUR_SNYK_API_TOKEN"
+$orgId = "YOUR_ORG_ID"
+$baseUri = "https://api.snyk.io/rest"
+$headers = @{
+    "Authorization" = "token $apiToken"
+    "Content-Type"  = "application/json"
+    "Accept"        = "application/vnd.api+json"
+}
+
+# === HELPER: PAGINATED API CALL ===
+function Get-PaginatedData {
+    param (
+        [string]$url
+    )
+    $allData = @()
+    do {
+        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+        $allData += $response.data
+
+        if ($response.links.next.href) {
+            $url = $response.links.next.href
+        } else {
+            $url = $null
+        }
+    } while ($url)
+
+    return $allData
+}
+
+# === GET PROJECTS ===
+function Get-Projects {
+    $url = "$baseUri/orgs/$orgId/projects"
+    return Get-PaginatedData -url $url
+}
+
+# === GET ASSETS ===
+function Get-Assets {
+    $url = "$baseUri/orgs/$orgId/assets"
+    return Get-PaginatedData -url $url
+}
+
+# === GET ISSUES for each project ===
+function Get-Issues {
+    param($projectId)
+    $url = "$baseUri/orgs/$orgId/projects/$projectId/issues"
+    return Get-PaginatedData -url $url
+}
+
+# === GET DEPENDENCIES for each project ===
+function Get-Dependencies {
+    param($projectId)
+    $url = "$baseUri/orgs/$orgId/projects/$projectId/dependencies"
+    return Get-PaginatedData -url $url
+}
+
+# === MAIN ===
+Write-Host "Fetching Projects..."
+$projects = Get-Projects
+$projects | Select-Object id, @{Name='name';Expression={$_.attributes.name}}, type |
+    Export-Csv -Path "snyk_projects.csv" -NoTypeInformation
+
+Write-Host "Fetching Assets..."
+$assets = Get-Assets
+$assets | Select-Object id, @{Name='name';Expression={$_.attributes.name}}, type |
+    Export-Csv -Path "snyk_assets.csv" -NoTypeInformation
+
+# Prepare storage for issues and dependencies
+$allIssues = @()
+$allDeps = @()
+
+Write-Host "Fetching Issues & Dependencies for each Project..."
+foreach ($project in $projects) {
+    $projectId = $project.id
+    $projectName = $project.attributes.name
+
+    Write-Host "  - Project: $projectName"
+
+    $issues = Get-Issues -projectId $projectId
+    foreach ($issue in $issues) {
+        $allIssues += [PSCustomObject]@{
+            ProjectId   = $projectId
+            ProjectName = $projectName
+            IssueId     = $issue.id
+            Type        = $issue.type
+            Title       = $issue.attributes.title
+            Severity    = $issue.attributes.severity
+            CVE         = ($issue.attributes.identifiers.cve -join ", ")
+        }
+    }
+
+    $deps = Get-Dependencies -projectId $projectId
+    foreach ($dep in $deps) {
+        $allDeps += [PSCustomObject]@{
+            ProjectId      = $projectId
+            ProjectName    = $projectName
+            PackageName    = $dep.attributes.package.name
+            Version        = $dep.attributes.package.version
+            DependencyType = $dep.attributes.type
+        }
+    }
+}
+
+$allIssues | Export-Csv -Path "snyk_issues.csv" -NoTypeInformation
+$allDeps   | Export-Csv -Path "snyk_dependencies.csv" -NoTypeInformation
+
+Write-Host "✅ Done! Exported:"
+Write-Host "  - snyk_projects.csv"
+Write-Host "  - snyk_assets.csv"
+Write-Host "  - snyk_issues.csv"
+Write-Host "  - snyk_dependencies.csv"
