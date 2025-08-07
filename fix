@@ -6,22 +6,25 @@ function Get-PaginatedData {
     $results = @()
     do {
         try {
+            Write-Host "📡 Fetching: $url" -ForegroundColor Gray
             $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
             $results += $response.data
 
-            # Patch: Cleanly extract next URL and preserve version
             if ($response.PSObject.Properties['links'] -and $response.links.next.href) {
-                # Remove any existing query strings
                 $baseNextUrl = $response.links.next.href -replace '\?.*$', ''
                 $url = "$baseNextUrl?version=$apiVersion&limit=$limit"
             } else {
                 $url = $null
             }
-
         } catch {
-            Write-Warning "❌ Error calling: $url"
-            Write-Warning $_.Exception.Message
-            $url = $null
+            if ($_.Exception.Response.StatusCode.value__ -eq 404) {
+                Write-Warning "⚠️ 404 Not Found - skipping this resource."
+                return @()  # return empty and exit loop
+            } else {
+                Write-Warning "🔥 Unexpected error calling: $url"
+                Write-Warning $_.Exception.Message
+                return @()
+            }
         }
     } while ($url)
 
