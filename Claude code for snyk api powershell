@@ -1,201 +1,196 @@
-# Snyk Data Extractor - Simple API Approach
-# Uses basic API calls to troubleshoot connectivity issues
+# Snyk Data Extractor - Final Working Version
+# Uses the confirmed working API endpoint with additional URL patterns
 
 param(
     [Parameter(Mandatory=$true)]
     [string]$ApiToken,
     
     [Parameter(Mandatory=$false)]
-    [string]$OrgId,
+    [string]$OrgId = "bfaad577-6f5a-4a81-ad27-ec2113e72731",  # Default to Thrivent org
     
     [Parameter(Mandatory=$false)]
     [string]$OutputPath = "."
 )
 
-# Different API base URLs to try
-$ApiUrls = @{
-    "LegacyV1" = "https://snyk.io/api/v1"
-    "ApiV1" = "https://api.snyk.io/v1"  
-    "RestApi" = "https://api.snyk.io/rest"
-}
+# Working API base URL (confirmed from your test)
+$BaseUrl = "https://api.snyk.io/v1"
 
-# Standard headers
+# Headers
 $Headers = @{
     "Authorization" = "token $ApiToken"
     "Content-Type" = "application/json"
 }
 
-$RestHeaders = @{
-    "Authorization" = "token $ApiToken"
-    "Content-Type" = "application/vnd.api+json"
-}
-
-# Function to test different API endpoints
-function Test-AllAPIEndpoints {
-    Write-Host "=== Testing API Endpoints ===" -ForegroundColor Cyan
+# Function to try multiple URL patterns for projects
+function Get-ProjectsAllPatterns {
+    param([string]$OrganizationId)
     
-    $workingEndpoints = @()
+    Write-Host "Trying multiple URL patterns for projects..." -ForegroundColor Yellow
     
-    # Test user endpoint on different bases
-    foreach ($name in $ApiUrls.Keys) {
-        $baseUrl = $ApiUrls[$name]
-        Write-Host "Testing $name ($baseUrl)..." -ForegroundColor Yellow
-        
+    # Different URL patterns to try
+    $urlPatterns = @(
+        "$BaseUrl/org/$OrganizationId/projects",
+        "$BaseUrl/orgs/$OrganizationId/projects", 
+        "$BaseUrl/organizations/$OrganizationId/projects",
+        "$BaseUrl/org/$OrganizationId/project",
+        "$BaseUrl/v1/org/$OrganizationId/projects",
+        "$BaseUrl/reporting/org/$OrganizationId/projects"
+    )
+    
+    $allProjects = @()
+    
+    foreach ($url in $urlPatterns) {
         try {
-            if ($name -eq "RestApi") {
-                # REST API has different structure
-                $testUrl = "$baseUrl/orgs?version=2021-06-04&limit=10"
-                $response = Invoke-RestMethod -Uri $testUrl -Headers $RestHeaders -Method GET -TimeoutSec 10
-                Write-Host "✓ $name REST endpoint working" -ForegroundColor Green
-                $workingEndpoints += @{ Name = $name; Type = "REST"; BaseUrl = $baseUrl }
-            } else {
-                # Try user/me endpoint
-                $testUrl = "$baseUrl/user/me"
-                $response = Invoke-RestMethod -Uri $testUrl -Headers $Headers -Method GET -TimeoutSec 10
-                Write-Host "✓ $name working - User: $($response.username)" -ForegroundColor Green
-                $workingEndpoints += @{ Name = $name; Type = "Standard"; BaseUrl = $baseUrl }
-            }
-        } catch {
-            Write-Host "✗ $name failed: $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-    
-    return $workingEndpoints
-}
-
-# Function to get organizations from working endpoint
-function Get-OrgsFromEndpoint {
-    param($Endpoint)
-    
-    Write-Host "Getting organizations from $($Endpoint.Name)..." -ForegroundColor Yellow
-    
-    try {
-        if ($Endpoint.Type -eq "REST") {
-            $url = "$($Endpoint.BaseUrl)/orgs?version=2021-06-04&limit=100"
-            $response = Invoke-RestMethod -Uri $url -Headers $RestHeaders -Method GET
+            Write-Host "  Trying: $url" -ForegroundColor Gray
+            $response = Invoke-RestMethod -Uri $url -Headers $Headers -Method GET -TimeoutSec 15
             
-            if ($response.data) {
-                $orgs = @()
-                foreach ($org in $response.data) {
-                    $orgs += [PSCustomObject]@{
-                        id = $org.id
-                        name = $org.attributes.name
-                        api_type = "REST"
-                    }
-                }
-                return $orgs
-            }
-        } else {
-            $url = "$($Endpoint.BaseUrl)/orgs"
-            $response = Invoke-RestMethod -Uri $url -Headers $Headers -Method GET
-            
-            if ($response.orgs) {
-                foreach ($org in $response.orgs) {
-                    $org | Add-Member -NotePropertyName "api_type" -NotePropertyValue "Standard"
-                }
-                return $response.orgs
-            }
-        }
-    } catch {
-        Write-Error "Failed to get orgs from $($Endpoint.Name): $($_.Exception.Message)"
-    }
-    
-    return @()
-}
-
-# Function to get projects using different methods
-function Get-ProjectsFromEndpoint {
-    param($Endpoint, $OrgId)
-    
-    Write-Host "Getting projects from $($Endpoint.Name) for org $OrgId..." -ForegroundColor Yellow
-    
-    $projects = @()
-    
-    try {
-        if ($Endpoint.Type -eq "REST") {
-            # REST API approach
-            $url = "$($Endpoint.BaseUrl)/orgs/$OrgId/projects?version=2021-06-04&limit=100"
-            $response = Invoke-RestMethod -Uri $url -Headers $RestHeaders -Method GET
-            
-            if ($response.data) {
-                foreach ($project in $response.data) {
-                    $projects += [PSCustomObject]@{
+            if ($response.projects) {
+                Write-Host "  ✓ SUCCESS! Found $($response.projects.Count) projects" -ForegroundColor Green
+                foreach ($project in $response.projects) {
+                    $allProjects += [PSCustomObject]@{
                         id = $project.id
-                        name = $project.attributes.name
-                        origin = $project.attributes.origin
-                        type = $project.attributes.type
-                        created = $project.attributes.created
-                        api_source = $Endpoint.Name
+                        name = $project.name
+                        origin = $project.origin
+                        type = $project.type
+                        created = $project.created
+                        isMonitored = $project.isMonitored
+                        totalDependencies = $project.totalDependencies
+                        issueCountsBySeverity = $project.issueCountsBySeverity
+                        remoteRepoUrl = $project.remoteRepoUrl
+                        lastTestedDate = $project.lastTestedDate
+                        browseUrl = $project.browseUrl
+                        targetFile = $project.targetFile
+                        targetReference = $project.targetReference
                     }
                 }
+                break  # Success, no need to try other patterns
+            } elseif ($response.data) {
+                # Handle different response structure
+                Write-Host "  ✓ SUCCESS! Found $($response.data.Count) projects (alternate structure)" -ForegroundColor Green
+                foreach ($project in $response.data) {
+                    $allProjects += [PSCustomObject]@{
+                        id = $project.id
+                        name = if ($project.attributes) { $project.attributes.name } else { $project.name }
+                        origin = if ($project.attributes) { $project.attributes.origin } else { $project.origin }
+                        type = if ($project.attributes) { $project.attributes.type } else { $project.type }
+                        created = if ($project.attributes) { $project.attributes.created } else { $project.created }
+                        isMonitored = $true
+                        totalDependencies = 0
+                        issueCountsBySeverity = @{}
+                        remoteRepoUrl = ""
+                        lastTestedDate = ""
+                        browseUrl = ""
+                        targetFile = if ($project.attributes) { $project.attributes.targetFile } else { $project.targetFile }
+                        targetReference = if ($project.attributes) { $project.attributes.targetReference } else { $project.targetReference }
+                    }
+                }
+                break
             }
-        } else {
-            # Standard API approach - try different URL patterns
-            $urlPatterns = @(
-                "$($Endpoint.BaseUrl)/org/$OrgId/projects",
-                "$($Endpoint.BaseUrl)/orgs/$OrgId/projects"
-            )
             
-            foreach ($url in $urlPatterns) {
-                try {
-                    Write-Host "  Trying: $url" -ForegroundColor Gray
-                    $response = Invoke-RestMethod -Uri $url -Headers $Headers -Method GET
-                    
-                    if ($response.projects) {
-                        foreach ($project in $response.projects) {
-                            $projects += [PSCustomObject]@{
-                                id = $project.id
-                                name = $project.name
-                                origin = $project.origin
-                                type = $project.type
-                                created = $project.created
-                                api_source = $Endpoint.Name
-                            }
-                        }
-                        break  # Success, no need to try other patterns
-                    }
-                } catch {
-                    Write-Host "    Failed: $($_.Exception.Message)" -ForegroundColor Red
-                    continue
-                }
-            }
+        } catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__ -as [int]
+            Write-Host "    Failed ($statusCode): $($_.Exception.Message)" -ForegroundColor Red
+            continue
         }
-        
-    } catch {
-        Write-Error "Failed to get projects: $($_.Exception.Message)"
     }
     
-    return $projects
+    return $allProjects
 }
 
-# Function to get issues for projects
-function Get-IssuesForProjects {
-    param($Endpoint, $OrgId, $Projects)
+# Function to get issues with multiple patterns
+function Get-IssuesAllPatterns {
+    param([string]$OrganizationId, [array]$Projects)
     
     if ($Projects.Count -eq 0) {
+        Write-Warning "No projects available for issue extraction"
         return @()
     }
     
-    Write-Host "Getting issues for $($Projects.Count) projects..." -ForegroundColor Yellow
+    Write-Host "Trying to get issues for $($Projects.Count) projects..." -ForegroundColor Yellow
+    
+    # Try organization-level issues first
+    $orgLevelPatterns = @(
+        "$BaseUrl/org/$OrganizationId/issues",
+        "$BaseUrl/orgs/$OrganizationId/issues",
+        "$BaseUrl/reporting/org/$OrganizationId/issues"
+    )
     
     $allIssues = @()
-    $successCount = 0
+    $foundOrgLevel = $false
     
-    foreach ($project in $Projects[0..([Math]::Min(10, $Projects.Count-1))]) {  # Limit to first 10 projects for testing
-        Write-Host "  Processing: $($project.name)" -ForegroundColor Green
-        
+    foreach ($url in $orgLevelPatterns) {
         try {
-            # Try different URL patterns for issues
-            $urlPatterns = @(
-                "$($Endpoint.BaseUrl)/org/$OrgId/project/$($project.id)/issues",
-                "$($Endpoint.BaseUrl)/orgs/$OrgId/projects/$($project.id)/issues"
+            Write-Host "  Trying org-level issues: $url" -ForegroundColor Gray
+            
+            # For org-level issues, try POST with filters
+            $body = @{
+                "filters" = @{
+                    "severities" = @("high", "medium", "low", "critical")
+                    "types" = @("vuln", "license")
+                }
+            } | ConvertTo-Json -Depth 5
+            
+            $response = Invoke-RestMethod -Uri $url -Headers $Headers -Method POST -Body $body -TimeoutSec 30
+            
+            if ($response.issues) {
+                Write-Host "  ✓ SUCCESS! Found $($response.issues.Count) org-level issues" -ForegroundColor Green
+                foreach ($issue in $response.issues) {
+                    $allIssues += [PSCustomObject]@{
+                        id = $issue.id
+                        title = $issue.title
+                        type = $issue.type
+                        severity = $issue.severity
+                        package = $issue.package
+                        version = $issue.version
+                        language = $issue.language
+                        packageManager = $issue.packageManager
+                        isPatchable = $issue.isPatchable
+                        isUpgradable = $issue.isUpgradable
+                        cvssScore = $issue.cvssScore
+                        cvssVector = $issue.CVSSv3
+                        disclosureTime = $issue.disclosureTime
+                        publicationTime = $issue.publicationTime
+                        introducedDate = $issue.introducedDate
+                        fixedIn = ($issue.fixedIn -join "; ")
+                        upgradePath = if ($issue.upgradePath) { ($issue.upgradePath -join " -> ") } else { "" }
+                        credit = ($issue.credit -join "; ")
+                        projectId = $issue.projectId
+                        projectName = $issue.projectName
+                        method = "org-level"
+                    }
+                }
+                $foundOrgLevel = $true
+                break
+            }
+        } catch {
+            Write-Host "    Failed: $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
+    }
+    
+    # If org-level didn't work, try project-level
+    if (-not $foundOrgLevel) {
+        Write-Host "  Org-level failed, trying project-level issues..." -ForegroundColor Yellow
+        
+        $projectCount = 0
+        $maxProjects = [Math]::Min(20, $Projects.Count)  # Limit to avoid timeout
+        
+        foreach ($project in $Projects[0..($maxProjects-1)]) {
+            $projectCount++
+            Write-Host "    Project $projectCount/$maxProjects : $($project.name)" -ForegroundColor Green
+            
+            $projectUrlPatterns = @(
+                "$BaseUrl/org/$OrganizationId/project/$($project.id)/issues",
+                "$BaseUrl/orgs/$OrganizationId/projects/$($project.id)/issues",
+                "$BaseUrl/org/$OrganizationId/projects/$($project.id)/issues"
             )
             
-            foreach ($url in $urlPatterns) {
+            foreach ($projectUrl in $projectUrlPatterns) {
                 try {
-                    $response = Invoke-RestMethod -Uri $url -Headers $Headers -Method GET -TimeoutSec 30
+                    $response = Invoke-RestMethod -Uri $projectUrl -Headers $Headers -Method GET -TimeoutSec 15
                     
                     if ($response.issues) {
+                        Write-Host "      Found $($response.issues.Count) issues" -ForegroundColor White
                         foreach ($issue in $response.issues) {
                             $allIssues += [PSCustomObject]@{
                                 id = $issue.id
@@ -204,31 +199,34 @@ function Get-IssuesForProjects {
                                 severity = $issue.severity
                                 package = $issue.package
                                 version = $issue.version
-                                is_patchable = $issue.isPatchable
-                                is_upgradable = $issue.isUpgradable
-                                cvss_score = $issue.cvssScore
-                                project_id = $project.id
-                                project_name = $project.name
-                                api_source = $Endpoint.Name
+                                language = $issue.language
+                                packageManager = $issue.packageManager
+                                isPatchable = $issue.isPatchable
+                                isUpgradable = $issue.isUpgradable
+                                cvssScore = $issue.cvssScore
+                                cvssVector = $issue.CVSSv3
+                                disclosureTime = $issue.disclosureTime
+                                publicationTime = $issue.publicationTime
+                                introducedDate = $issue.introducedDate
+                                fixedIn = ($issue.fixedIn -join "; ")
+                                upgradePath = if ($issue.upgradePath) { ($issue.upgradePath -join " -> ") } else { "" }
+                                credit = ($issue.credit -join "; ")
+                                projectId = $project.id
+                                projectName = $project.name
+                                method = "project-level"
                             }
                         }
-                        $successCount++
-                        Write-Host "    Found $($response.issues.Count) issues" -ForegroundColor White
-                        break
+                        break  # Success for this project
                     }
                 } catch {
-                    continue
+                    continue  # Try next URL pattern
                 }
             }
             
-            Start-Sleep -Milliseconds 100
-            
-        } catch {
-            Write-Warning "Failed to get issues for $($project.name): $($_.Exception.Message)"
+            Start-Sleep -Milliseconds 200  # Rate limiting
         }
     }
     
-    Write-Host "Successfully processed $successCount/$($Projects.Count) projects" -ForegroundColor Green
     return $allIssues
 }
 
@@ -246,99 +244,57 @@ function Save-ToCSV {
     
     try {
         $Data | Export-Csv -Path $filePath -NoTypeInformation -Encoding UTF8
-        Write-Host "Saved $($Data.Count) records to: $filePath" -ForegroundColor Green
+        Write-Host "✓ Saved $($Data.Count) records to: $filePath" -ForegroundColor Green
+        
+        # Show first few records as preview
+        Write-Host "Preview of saved data:" -ForegroundColor Cyan
+        $Data | Select-Object -First 3 | Format-Table -AutoSize | Out-String | Write-Host
+        
     } catch {
         Write-Error "Failed to save CSV: $($_.Exception.Message)"
     }
 }
 
 # Main execution
-Write-Host "=== Snyk API Diagnostics and Data Extraction ===" -ForegroundColor Cyan
-Write-Host "Token: $($ApiToken.Substring(0,10))..." -ForegroundColor Gray
+Write-Host "=== Snyk Data Extractor - Thrivent Organization ===" -ForegroundColor Cyan
+Write-Host "Organization: Thrivent ($OrgId)" -ForegroundColor Green
+Write-Host "API Endpoint: $BaseUrl" -ForegroundColor Green
+Write-Host "Output Path: $OutputPath" -ForegroundColor Green
 
 # Create output directory
 if (!(Test-Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 }
 
-# Step 1: Test all API endpoints
-$workingEndpoints = Test-AllAPIEndpoints
-
-if ($workingEndpoints.Count -eq 0) {
-    Write-Error "No working API endpoints found. Please check your API token."
-    exit 1
-}
-
-Write-Host "`nFound $($workingEndpoints.Count) working endpoint(s)" -ForegroundColor Green
-
-# Step 2: Get organizations from working endpoints
-$allOrgs = @()
-foreach ($endpoint in $workingEndpoints) {
-    $orgs = Get-OrgsFromEndpoint -Endpoint $endpoint
-    $allOrgs += $orgs
-}
-
-if ($allOrgs.Count -eq 0) {
-    Write-Error "No organizations found from any endpoint"
-    exit 1
-}
-
-Write-Host "`nAvailable organizations:" -ForegroundColor Yellow
-$allOrgs | ForEach-Object { 
-    Write-Host "  - $($_.name) (ID: $($_.id)) [via $($_.api_type)]" -ForegroundColor White 
-}
-
-# Step 3: Select organization
-if (-not $OrgId) {
-    if ($allOrgs.Count -eq 1) {
-        $selectedOrg = $allOrgs[0]
-        $OrgId = $selectedOrg.id
-        Write-Host "`nUsing organization: $($selectedOrg.name)" -ForegroundColor Green
-    } else {
-        Write-Host "`nMultiple organizations found. Please specify -OrgId:" -ForegroundColor Yellow
-        $allOrgs | ForEach-Object { 
-            Write-Host "  -OrgId '$($_.id)' # $($_.name)" -ForegroundColor White 
-        }
-        exit 1
-    }
-} else {
-    $selectedOrg = $allOrgs | Where-Object { $_.id -eq $OrgId }
-    if (-not $selectedOrg) {
-        Write-Error "Organization ID '$OrgId' not found"
-        exit 1
-    }
-    Write-Host "`nUsing specified organization: $($selectedOrg.name)" -ForegroundColor Green
-}
-
-# Step 4: Find working endpoint for this org type
-$workingEndpoint = $workingEndpoints | Where-Object { $_.Type -eq $selectedOrg.api_type }
-if (-not $workingEndpoint) {
-    $workingEndpoint = $workingEndpoints[0]  # Use first working endpoint
-}
-
-Write-Host "Using API endpoint: $($workingEndpoint.Name)" -ForegroundColor Cyan
-
-# Step 5: Get projects
+# Extract Projects
 Write-Host "`n--- Extracting Projects ---" -ForegroundColor Magenta
-$projects = Get-ProjectsFromEndpoint -Endpoint $workingEndpoint -OrgId $OrgId
+$projects = Get-ProjectsAllPatterns -OrganizationId $OrgId
 
 if ($projects.Count -gt 0) {
-    Write-Host "Found $($projects.Count) projects" -ForegroundColor Green
+    Write-Host "Successfully found $($projects.Count) projects!" -ForegroundColor Green
     Save-ToCSV -Data $projects -FileName "snyk_projects"
     
-    # Step 6: Get issues
-    Write-Host "`n--- Extracting Issues (Sample) ---" -ForegroundColor Magenta
-    $issues = Get-IssuesForProjects -Endpoint $workingEndpoint -OrgId $OrgId -Projects $projects
+    # Extract Issues
+    Write-Host "`n--- Extracting Issues ---" -ForegroundColor Magenta
+    $issues = Get-IssuesAllPatterns -OrganizationId $OrgId -Projects $projects
     
     if ($issues.Count -gt 0) {
+        Write-Host "Successfully found $($issues.Count) issues!" -ForegroundColor Green
         Save-ToCSV -Data $issues -FileName "snyk_issues"
+    } else {
+        Write-Warning "No issues found using any method"
     }
+    
 } else {
-    Write-Warning "No projects found"
+    Write-Error "No projects found using any URL pattern"
+    Write-Host "`nPossible reasons:" -ForegroundColor Yellow
+    Write-Host "1. Organization has no projects" -ForegroundColor White
+    Write-Host "2. API token doesn't have project access" -ForegroundColor White  
+    Write-Host "3. Different API endpoint needed" -ForegroundColor White
+    Write-Host "4. Projects are in a different organization" -ForegroundColor White
 }
 
-Write-Host "`n=== Summary ===" -ForegroundColor Cyan
-Write-Host "Working endpoints: $($workingEndpoints.Count)" -ForegroundColor Green
-Write-Host "Organizations: $($allOrgs.Count)" -ForegroundColor Green  
-Write-Host "Projects: $($projects.Count)" -ForegroundColor Green
-Write-Host "Issues: $(if($issues) {$issues.Count} else {0})" -ForegroundColor Green
+Write-Host "`n=== Final Summary ===" -ForegroundColor Cyan
+Write-Host "Projects extracted: $($projects.Count)" -ForegroundColor $(if($projects.Count -gt 0){"Green"}else{"Red"})
+Write-Host "Issues extracted: $(if($issues){$issues.Count}else{0})" -ForegroundColor $(if($issues -and $issues.Count -gt 0){"Green"}else{"Red"})
+Write-Host "Files created in: $OutputPath" -ForegroundColor Green
