@@ -328,4 +328,46 @@ if (-not $OrgId) {
     } else {
         Write-Host "Multiple organizations available. Please specify -OrgId parameter:" -ForegroundColor Yellow
         foreach ($org in $orgs) {
-            Write-Host "  Use: -Org
+            Write-Host "  Use: -OrgId '$($org.id)' for '$($org.name)'" -ForegroundColor White
+        }
+        exit 1
+    }
+} else {
+    # Verify the provided OrgId exists
+    $selectedOrg = $orgs | Where-Object { $_.id -eq $OrgId }
+    if (-not $selectedOrg) {
+        Write-Error "Organization ID '$OrgId' not found. Available IDs: $($orgs.id -join ', ')"
+        exit 1
+    }
+    Write-Host "Using specified organization: $($selectedOrg.name)" -ForegroundColor Green
+}
+
+# Create output directory
+if (!(Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+}
+
+Write-Host "`nOrganization ID: $OrgId" -ForegroundColor Cyan
+Write-Host "Output Path: $OutputPath" -ForegroundColor Cyan
+
+# Extract Projects
+Write-Host "`n--- Extracting Projects ---" -ForegroundColor Magenta
+$projects = Get-AllProjects -OrganizationId $OrgId
+
+if ($projects.Count -gt 0) {
+    Save-ToCSV -Data $projects -FileName "snyk_projects"
+    
+    # Extract Issues
+    Write-Host "`n--- Extracting Issues ---" -ForegroundColor Magenta
+    $issues = Get-AllIssues -OrganizationId $OrgId -Projects $projects
+    
+    if ($issues.Count -gt 0) {
+        Save-ToCSV -Data $issues -FileName "snyk_issues"
+    }
+} else {
+    Write-Warning "No projects found. Cannot extract issues."
+}
+
+Write-Host "`n=== Extraction Complete ===" -ForegroundColor Cyan
+Write-Host "Projects: $($projects.Count)" -ForegroundColor Green
+Write-Host "Issues: $(if($issues) {$issues.Count} else {0})" -ForegroundColor Green
