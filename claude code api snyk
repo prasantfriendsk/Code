@@ -1,0 +1,340 @@
+# Snyk Projects and Issues CSV Extractor with Pagination
+# Handles more than 1000 records using REST API v1 and GraphQL
+
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ApiToken,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OrgId,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = "."
+)
+
+# API URLs
+$RestBaseUrl = "https://api.snyk.io/v1"
+$GraphQLUrl = "https://api.snyk.io/v1/graphql"
+
+# Headers for API requests
+$Headers = @{
+    "Authorization" = "token $ApiToken"
+    "Content-Type" = "application/json"
+}
+
+# Function to make paginated REST API requests
+function Invoke-PaginatedRestRequest {
+    param(
+        [string]$Url,
+        [int]$PerPage = 100
+    )
+    
+    $allResults = @()
+    $page = 1
+    
+    do {
+        $paginatedUrl = "$Url" + $(if ($Url.Contains("?")) { "&" } else { "?" }) + "perPage=$PerPage&page=$page"
+        
+        try {
+            Write-Host "Fetching page $page from: $paginatedUrl" -ForegroundColor Green
+            $response = Invoke-RestMethod -Uri $paginatedUrl -Headers $Headers -Method GET
+            
+            if ($response.projects) {
+                $allResults += $response.projects
+                $hasMore = $response.projects.Count -eq $PerPage
+            } elseif ($response.issues) {
+                $allResults += $response.issues
+                $hasMore = $response.issues.Count -eq $PerPage
+            } else {
+                $hasMore = $false
+            }
+            
+            $page++
+            Start-Sleep -Milliseconds 500  # Rate limiting
+            
+        } catch {
+            Write-Error "Failed to fetch page $page : $($_.Exception.Message)"
+            break
+        }
+        
+    } while ($hasMore)
+    
+    return $allResults
+}
+
+# Function to make GraphQL requests for large datasets
+function Invoke-GraphQLRequest {
+    param(
+        [string]$Query,
+        [hashtable]$Variables = @{}
+    )
+    
+    $body = @{
+        query = $Query
+        variables = $Variables
+    } | ConvertTo-Json -Depth 10
+    
+    try {
+        $response = Invoke-RestMethod -Uri $GraphQLUrl -Headers $Headers -Method POST -Body $body
+        return $response
+    } catch {
+        Write-Error "GraphQL request failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Function to get all projects using pagination
+function Get-AllProjects {
+    param([string]$OrganizationId)
+    
+    Write-Host "Retrieving all projects for organization: $OrganizationId" -ForegroundColor Yellow
+    
+    # Use REST API with pagination for projects
+    $url = "$RestBaseUrl/org/$OrganizationId/projects"
+    $projects = Invoke-PaginatedRestRequest -Url $url
+    
+    Write-Host "Retrieved $($projects.Count) projects" -ForegroundColor Green
+    return $projects
+}
+
+# Function to get all issues using GraphQL (better for large datasets)
+function Get-AllIssues {
+    param([string]$OrganizationId)
+    
+    Write-Host "Retrieving all issues for organization: $OrganizationId" -ForegroundColor Yellow
+    
+    $query = @"
+query GetOrgIssues(`$orgId: String!, `$after: String) {
+  organization(id: `$orgId) {
+    issues(first: 100, after: `$after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        title
+        severity
+        type
+        status
+        introducedDate
+        disclosureTime
+        publicationTime
+        credit
+        cvssScore
+        language
+        packageManager
+        packageName
+        version
+        fixedIn
+        patches
+        upgradePath
+        isPatchable
+        isUpgradable
+        jiraIssueUrl
+        project {
+          id
+          name
+          url
+          created
+          origin
+          type
+          readOnly
+          testFrequency
+          totalDependencies
+          issueCountsBySeverity {
+            low
+            medium
+            high
+            critical
+          }
+        }
+      }
+    }
+  }
+}
+"@
+
+    $allIssues = @()
+    $hasNextPage = $true
+    $cursor = $null
+    
+    while ($hasNextPage) {
+        Write-Host "Fetching issues batch..." -ForegroundColor Green
+        
+        $variables = @{
+            orgId = $OrganizationId
+        }
+        
+        if ($cursor) {
+            $variables.after = $cursor
+        }
+        
+        $response = Invoke-GraphQLRequest -Query $query -Variables $variables
+        
+        if ($response -and $response.data -and $response.data.organization -and $response.data.organization.issues) {
+            $issues = $response.data.organization.issues
+            $allIssues += $issues.nodes
+            
+            $hasNextPage = $issues.pageInfo.hasNextPage
+            $cursor = $issues.pageInfo.endCursor
+            
+            Write-Host "Retrieved $($issues.nodes.Count) issues, Total: $($allIssues.Count)" -ForegroundColor Green
+            
+            Start-Sleep -Milliseconds 500  # Rate limiting
+        } else {
+            Write-Warning "No issues data in response or API error"
+            break
+        }
+    }
+    
+    Write-Host "Retrieved total of $($allIssues.Count) issues" -ForegroundColor Green
+    return $allIssues
+}
+
+# Function to flatten and prepare data for CSV
+function ConvertTo-FlatCSVData {
+    param(
+        [array]$Data,
+        [string]$Type
+    )
+    
+    $flatData = @()
+    
+    foreach ($item in $Data) {
+        if ($Type -eq "issues") {
+            # Flatten issue data
+            $flatItem = [PSCustomObject]@{
+                IssueId = $item.id
+                Title = $item.title
+                Severity = $item.severity
+                Type = $item.type
+                Status = $item.status
+                IntroducedDate = $item.introducedDate
+                DisclosureTime = $item.disclosureTime
+                PublicationTime = $item.publicationTime
+                CvssScore = $item.cvssScore
+                Language = $item.language
+                PackageManager = $item.packageManager
+                PackageName = $item.packageName
+                Version = $item.version
+                FixedIn = ($item.fixedIn -join "; ")
+                IsPatchable = $item.isPatchable
+                IsUpgradable = $item.isUpgradable
+                UpgradePath = ($item.upgradePath -join " -> ")
+                ProjectId = $item.project.id
+                ProjectName = $item.project.name
+                ProjectUrl = $item.project.url
+                ProjectCreated = $item.project.created
+                ProjectOrigin = $item.project.origin
+                ProjectType = $item.project.type
+                ProjectReadOnly = $item.project.readOnly
+                ProjectTestFrequency = $item.project.testFrequency
+                ProjectTotalDependencies = $item.project.totalDependencies
+                ProjectCriticalIssues = $item.project.issueCountsBySeverity.critical
+                ProjectHighIssues = $item.project.issueCountsBySeverity.high
+                ProjectMediumIssues = $item.project.issueCountsBySeverity.medium
+                ProjectLowIssues = $item.project.issueCountsBySeverity.low
+            }
+        } else {
+            # Flatten project data
+            $flatItem = [PSCustomObject]@{
+                ProjectId = $item.id
+                ProjectName = $item.name
+                ProjectUrl = $item.remoteRepoUrl
+                Created = $item.created
+                Origin = $item.origin
+                Type = $item.type
+                ReadOnly = $item.readOnly
+                TestFrequency = $item.testFrequency
+                TotalDependencies = $item.totalDependencies
+                CriticalIssues = $item.issueCountsBySeverity.critical
+                HighIssues = $item.issueCountsBySeverity.high
+                MediumIssues = $item.issueCountsBySeverity.medium
+                LowIssues = $item.issueCountsBySeverity.low
+                LastTestedDate = $item.lastTestedDate
+                BrowseUrl = $item.browseUrl
+            }
+        }
+        
+        $flatData += $flatItem
+    }
+    
+    return $flatData
+}
+
+# Function to save CSV data
+function Save-CSVData {
+    param(
+        [array]$Data,
+        [string]$FileName
+    )
+    
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $filePath = Join-Path $OutputPath "$FileName`_$timestamp.csv"
+    
+    try {
+        $Data | Export-Csv -Path $filePath -NoTypeInformation -Encoding UTF8
+        Write-Host "Data saved to: $filePath ($($Data.Count) records)" -ForegroundColor Green
+        return $filePath
+    } catch {
+        Write-Error "Failed to save CSV: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Get organization ID if not provided
+if (-not $OrgId) {
+    Write-Host "Retrieving organizations..." -ForegroundColor Yellow
+    try {
+        $orgsResponse = Invoke-RestMethod -Uri "$RestBaseUrl/orgs" -Headers $Headers
+        if ($orgsResponse.orgs -and $orgsResponse.orgs.Count -eq 1) {
+            $OrgId = $orgsResponse.orgs[0].id
+            Write-Host "Using organization: $($orgsResponse.orgs[0].name) ($OrgId)" -ForegroundColor Green
+        } elseif ($orgsResponse.orgs -and $orgsResponse.orgs.Count -gt 1) {
+            Write-Host "Available organizations:" -ForegroundColor Yellow
+            foreach ($org in $orgsResponse.orgs) {
+                Write-Host "  - $($org.name) ($($org.id))" -ForegroundColor White
+            }
+            Write-Error "Multiple organizations found. Please specify -OrgId parameter."
+            exit 1
+        }
+    } catch {
+        Write-Error "Failed to retrieve organizations: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+# Main execution
+Write-Host "=== Snyk Large Dataset CSV Extractor ===" -ForegroundColor Cyan
+Write-Host "Organization ID: $OrgId" -ForegroundColor Cyan
+Write-Host "Output Path: $OutputPath" -ForegroundColor Cyan
+
+# Create output directory if it doesn't exist
+if (!(Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force
+}
+
+# Extract Projects
+Write-Host "`n--- Extracting Projects ---" -ForegroundColor Magenta
+$projects = Get-AllProjects -OrganizationId $OrgId
+if ($projects -and $projects.Count -gt 0) {
+    $flatProjects = ConvertTo-FlatCSVData -Data $projects -Type "projects"
+    Save-CSVData -Data $flatProjects -FileName "snyk_projects"
+} else {
+    Write-Warning "No projects found"
+}
+
+# Extract Issues
+Write-Host "`n--- Extracting Issues ---" -ForegroundColor Magenta
+$issues = Get-AllIssues -OrganizationId $OrgId
+if ($issues -and $issues.Count -gt 0) {
+    $flatIssues = ConvertTo-FlatCSVData -Data $issues -Type "issues"
+    Save-CSVData -Data $flatIssues -FileName "snyk_issues"
+} else {
+    Write-Warning "No issues found"
+}
+
+Write-Host "`n=== Extraction Complete ===" -ForegroundColor Cyan
+Write-Host "Projects extracted: $($projects.Count)" -ForegroundColor Green
+Write-Host "Issues extracted: $($issues.Count)" -ForegroundColor Green
