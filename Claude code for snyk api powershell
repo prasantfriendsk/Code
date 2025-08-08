@@ -1,0 +1,237 @@
+# Snyk Data Retrieval PowerShell Script
+# Requires Snyk API token and PowerShell 5.1+
+
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ApiToken,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OrgId,
+    
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("vulnerabilities", "projects", "organizations", "issues", "dependencies")]
+    [string]$DataType = "projects",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = ".",
+    
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("json", "csv")]
+    [string]$OutputFormat = "json"
+)
+
+# Snyk API base URL
+$BaseUrl = "https://api.snyk.io/v1"
+
+# Headers for API requests
+$Headers = @{
+    "Authorization" = "token $ApiToken"
+    "Content-Type" = "application/json"
+}
+
+# Function to make API requests with error handling
+function Invoke-SnykApiRequest {
+    param(
+        [string]$Url,
+        [string]$Method = "GET",
+        [hashtable]$Body = $null
+    )
+    
+    try {
+        Write-Host "Making request to: $Url" -ForegroundColor Green
+        
+        $params = @{
+            Uri = $Url
+            Method = $Method
+            Headers = $Headers
+        }
+        
+        if ($Body) {
+            $params.Body = $Body | ConvertTo-Json -Depth 10
+        }
+        
+        $response = Invoke-RestMethod @params
+        return $response
+    }
+    catch {
+        Write-Error "API request failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Function to get all organizations
+function Get-SnykOrganizations {
+    Write-Host "Retrieving Snyk organizations..." -ForegroundColor Yellow
+    $url = "$BaseUrl/orgs"
+    return Invoke-SnykApiRequest -Url $url
+}
+
+# Function to get projects for an organization
+function Get-SnykProjects {
+    param([string]$OrganizationId)
+    
+    Write-Host "Retrieving projects for organization: $OrganizationId" -ForegroundColor Yellow
+    $url = "$BaseUrl/org/$OrganizationId/projects"
+    return Invoke-SnykApiRequest -Url $url
+}
+
+# Function to get vulnerabilities for a project
+function Get-SnykVulnerabilities {
+    param(
+        [string]$OrganizationId,
+        [string]$ProjectId
+    )
+    
+    Write-Host "Retrieving vulnerabilities for project: $ProjectId" -ForegroundColor Yellow
+    $url = "$BaseUrl/org/$OrganizationId/project/$ProjectId/issues"
+    return Invoke-SnykApiRequest -Url $url
+}
+
+# Function to get dependencies for a project
+function Get-SnykDependencies {
+    param(
+        [string]$OrganizationId,
+        [string]$ProjectId
+    )
+    
+    Write-Host "Retrieving dependencies for project: $ProjectId" -ForegroundColor Yellow
+    $url = "$BaseUrl/org/$OrganizationId/project/$ProjectId/dependencies"
+    return Invoke-SnykApiRequest -Url $url
+}
+
+# Function to get issues across organization
+function Get-SnykIssues {
+    param([string]$OrganizationId)
+    
+    Write-Host "Retrieving issues for organization: $OrganizationId" -ForegroundColor Yellow
+    $url = "$BaseUrl/org/$OrganizationId/issues"
+    
+    # Use POST request for filtering options
+    $body = @{
+        "filters" = @{
+            "severities" = @("high", "medium", "low")
+            "types" = @("vuln", "license")
+        }
+    }
+    
+    return Invoke-SnykApiRequest -Url $url -Method "POST" -Body $body
+}
+
+# Function to save data to file
+function Save-DataToFile {
+    param(
+        [object]$Data,
+        [string]$FileName,
+        [string]$Format
+    )
+    
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $fullPath = Join-Path $OutputPath "$FileName`_$timestamp.$Format"
+    
+    try {
+        switch ($Format) {
+            "json" {
+                $Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $fullPath -Encoding UTF8
+            }
+            "csv" {
+                if ($Data -is [array] -and $Data.Count -gt 0) {
+                    $Data | ConvertTo-Csv -NoTypeInformation | Out-File -FilePath $fullPath -Encoding UTF8
+                } else {
+                    Write-Warning "Data cannot be converted to CSV format"
+                    $Data | ConvertTo-Json -Depth 10 | Out-File -FilePath "$($fullPath -replace '.csv', '.json')" -Encoding UTF8
+                }
+            }
+        }
+        Write-Host "Data saved to: $fullPath" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to save data: $($_.Exception.Message)"
+    }
+}
+
+# Main execution logic
+Write-Host "=== Snyk Data Retrieval Script ===" -ForegroundColor Cyan
+Write-Host "Data Type: $DataType" -ForegroundColor Cyan
+Write-Host "Output Format: $OutputFormat" -ForegroundColor Cyan
+
+# Get organizations if OrgId is not provided
+if (-not $OrgId) {
+    $orgs = Get-SnykOrganizations
+    if ($orgs -and $orgs.orgs) {
+        Write-Host "Available organizations:" -ForegroundColor Yellow
+        foreach ($org in $orgs.orgs) {
+            Write-Host "  - $($org.name) ($($org.id))" -ForegroundColor White
+        }
+        
+        if ($orgs.orgs.Count -eq 1) {
+            $OrgId = $orgs.orgs[0].id
+            Write-Host "Using organization: $($orgs.orgs[0].name)" -ForegroundColor Green
+        } else {
+            Write-Host "Multiple organizations found. Please specify -OrgId parameter." -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        Write-Error "Failed to retrieve organizations"
+        exit 1
+    }
+}
+
+# Execute based on data type
+switch ($DataType) {
+    "organizations" {
+        $data = Get-SnykOrganizations
+        if ($data) {
+            Save-DataToFile -Data $data.orgs -FileName "snyk_organizations" -Format $OutputFormat
+        }
+    }
+    
+    "projects" {
+        $data = Get-SnykProjects -OrganizationId $OrgId
+        if ($data) {
+            Save-DataToFile -Data $data.projects -FileName "snyk_projects" -Format $OutputFormat
+        }
+    }
+    
+    "issues" {
+        $data = Get-SnykIssues -OrganizationId $OrgId
+        if ($data) {
+            Save-DataToFile -Data $data.issues -FileName "snyk_issues" -Format $OutputFormat
+        }
+    }
+    
+    "vulnerabilities" {
+        $projects = Get-SnykProjects -OrganizationId $OrgId
+        if ($projects -and $projects.projects) {
+            $allVulns = @()
+            foreach ($project in $projects.projects) {
+                $vulns = Get-SnykVulnerabilities -OrganizationId $OrgId -ProjectId $project.id
+                if ($vulns -and $vulns.issues) {
+                    foreach ($vuln in $vulns.issues) {
+                        $vuln | Add-Member -NotePropertyName "projectId" -NotePropertyValue $project.id
+                        $vuln | Add-Member -NotePropertyName "projectName" -NotePropertyValue $project.name
+                        $allVulns += $vuln
+                    }
+                }
+            }
+            Save-DataToFile -Data $allVulns -FileName "snyk_vulnerabilities" -Format $OutputFormat
+        }
+    }
+    
+    "dependencies" {
+        $projects = Get-SnykProjects -OrganizationId $OrgId
+        if ($projects -and $projects.projects) {
+            $allDeps = @()
+            foreach ($project in $projects.projects) {
+                $deps = Get-SnykDependencies -OrganizationId $OrgId -ProjectId $project.id
+                if ($deps) {
+                    $deps | Add-Member -NotePropertyName "projectId" -NotePropertyValue $project.id
+                    $deps | Add-Member -NotePropertyName "projectName" -NotePropertyValue $project.name
+                    $allDeps += $deps
+                }
+            }
+            Save-DataToFile -Data $allDeps -FileName "snyk_dependencies" -Format $OutputFormat
+        }
+    }
+}
+
+Write-Host "=== Script Execution Complete ===" -ForegroundColor Cyan
