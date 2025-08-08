@@ -1,5 +1,5 @@
-# Snyk Data Retrieval PowerShell Script
-# Requires Snyk API token and PowerShell 5.1+
+# Fixed Snyk Projects and Issues CSV Extractor
+# Uses REST API v1 with proper error handling and pagination
 
 param(
     [Parameter(Mandatory=$true)]
@@ -9,19 +9,11 @@ param(
     [string]$OrgId,
     
     [Parameter(Mandatory=$false)]
-    [ValidateSet("vulnerabilities", "projects", "organizations", "issues", "dependencies")]
-    [string]$DataType = "projects",
-    
-    [Parameter(Mandatory=$false)]
-    [string]$OutputPath = ".",
-    
-    [Parameter(Mandatory=$false)]
-    [ValidateSet("json", "csv")]
-    [string]$OutputFormat = "json"
+    [string]$OutputPath = "."
 )
 
-# Snyk API base URL
-$BaseUrl = "https://api.snyk.io/v1"
+# API URLs
+$RestBaseUrl = "https://api.snyk.io/v1"
 
 # Headers for API requests
 $Headers = @{
@@ -29,209 +21,280 @@ $Headers = @{
     "Content-Type" = "application/json"
 }
 
-# Function to make API requests with error handling
-function Invoke-SnykApiRequest {
-    param(
-        [string]$Url,
-        [string]$Method = "GET",
-        [hashtable]$Body = $null
-    )
-    
+# Function to test API connectivity
+function Test-SnykAPI {
     try {
-        Write-Host "Making request to: $Url" -ForegroundColor Green
-        
-        $params = @{
-            Uri = $Url
-            Method = $Method
-            Headers = $Headers
-        }
-        
-        if ($Body) {
-            $params.Body = $Body | ConvertTo-Json -Depth 10
-        }
-        
-        $response = Invoke-RestMethod @params
-        return $response
-    }
-    catch {
-        Write-Error "API request failed: $($_.Exception.Message)"
-        return $null
+        Write-Host "Testing API connectivity..." -ForegroundColor Yellow
+        $response = Invoke-RestMethod -Uri "$RestBaseUrl/user/me" -Headers $Headers -Method GET
+        Write-Host "API connection successful. User: $($response.username)" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Error "API connection failed: $($_.Exception.Message)"
+        return $false
     }
 }
 
-# Function to get all organizations
-function Get-SnykOrganizations {
-    Write-Host "Retrieving Snyk organizations..." -ForegroundColor Yellow
-    $url = "$BaseUrl/orgs"
-    return Invoke-SnykApiRequest -Url $url
+# Function to get organizations with error handling
+function Get-Organizations {
+    try {
+        Write-Host "Retrieving organizations..." -ForegroundColor Yellow
+        $response = Invoke-RestMethod -Uri "$RestBaseUrl/orgs" -Headers $Headers -Method GET
+        
+        if ($response.orgs -and $response.orgs.Count -gt 0) {
+            Write-Host "Found $($response.orgs.Count) organization(s):" -ForegroundColor Green
+            foreach ($org in $response.orgs) {
+                Write-Host "  - $($org.name) (ID: $($org.id))" -ForegroundColor White
+            }
+            return $response.orgs
+        } else {
+            Write-Warning "No organizations found"
+            return @()
+        }
+    } catch {
+        Write-Error "Failed to retrieve organizations: $($_.Exception.Message)"
+        return @()
+    }
 }
 
-# Function to get projects for an organization
-function Get-SnykProjects {
+# Function to get projects with pagination using REST API only
+function Get-AllProjects {
     param([string]$OrganizationId)
     
     Write-Host "Retrieving projects for organization: $OrganizationId" -ForegroundColor Yellow
-    $url = "$BaseUrl/org/$OrganizationId/projects"
-    return Invoke-SnykApiRequest -Url $url
-}
-
-# Function to get vulnerabilities for a project
-function Get-SnykVulnerabilities {
-    param(
-        [string]$OrganizationId,
-        [string]$ProjectId
-    )
     
-    Write-Host "Retrieving vulnerabilities for project: $ProjectId" -ForegroundColor Yellow
-    $url = "$BaseUrl/org/$OrganizationId/project/$ProjectId/issues"
-    return Invoke-SnykApiRequest -Url $url
-}
-
-# Function to get dependencies for a project
-function Get-SnykDependencies {
-    param(
-        [string]$OrganizationId,
-        [string]$ProjectId
-    )
+    $allProjects = @()
+    $page = 1
+    $perPage = 100
     
-    Write-Host "Retrieving dependencies for project: $ProjectId" -ForegroundColor Yellow
-    $url = "$BaseUrl/org/$OrganizationId/project/$ProjectId/dependencies"
-    return Invoke-SnykApiRequest -Url $url
-}
-
-# Function to get issues across organization
-function Get-SnykIssues {
-    param([string]$OrganizationId)
-    
-    Write-Host "Retrieving issues for organization: $OrganizationId" -ForegroundColor Yellow
-    $url = "$BaseUrl/org/$OrganizationId/issues"
-    
-    # Use POST request for filtering options
-    $body = @{
-        "filters" = @{
-            "severities" = @("high", "medium", "low")
-            "types" = @("vuln", "license")
-        }
-    }
-    
-    return Invoke-SnykApiRequest -Url $url -Method "POST" -Body $body
-}
-
-# Function to save data to file
-function Save-DataToFile {
-    param(
-        [object]$Data,
-        [string]$FileName,
-        [string]$Format
-    )
-    
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $fullPath = Join-Path $OutputPath "$FileName`_$timestamp.$Format"
-    
-    try {
-        switch ($Format) {
-            "json" {
-                $Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $fullPath -Encoding UTF8
+    do {
+        try {
+            $url = "$RestBaseUrl/org/$OrganizationId/projects?perPage=$perPage&page=$page"
+            Write-Host "Fetching projects page $page..." -ForegroundColor Green
+            
+            $response = Invoke-RestMethod -Uri $url -Headers $Headers -Method GET
+            
+            if ($response.projects) {
+                $allProjects += $response.projects
+                Write-Host "Page $page : Retrieved $($response.projects.Count) projects" -ForegroundColor Green
+                
+                # Check if we got fewer results than requested (last page)
+                $hasMore = $response.projects.Count -eq $perPage
+            } else {
+                $hasMore = $false
             }
-            "csv" {
-                if ($Data -is [array] -and $Data.Count -gt 0) {
-                    $Data | ConvertTo-Csv -NoTypeInformation | Out-File -FilePath $fullPath -Encoding UTF8
-                } else {
-                    Write-Warning "Data cannot be converted to CSV format"
-                    $Data | ConvertTo-Json -Depth 10 | Out-File -FilePath "$($fullPath -replace '.csv', '.json')" -Encoding UTF8
-                }
-            }
-        }
-        Write-Host "Data saved to: $fullPath" -ForegroundColor Green
-    }
-    catch {
-        Write-Error "Failed to save data: $($_.Exception.Message)"
-    }
-}
-
-# Main execution logic
-Write-Host "=== Snyk Data Retrieval Script ===" -ForegroundColor Cyan
-Write-Host "Data Type: $DataType" -ForegroundColor Cyan
-Write-Host "Output Format: $OutputFormat" -ForegroundColor Cyan
-
-# Get organizations if OrgId is not provided
-if (-not $OrgId) {
-    $orgs = Get-SnykOrganizations
-    if ($orgs -and $orgs.orgs) {
-        Write-Host "Available organizations:" -ForegroundColor Yellow
-        foreach ($org in $orgs.orgs) {
-            Write-Host "  - $($org.name) ($($org.id))" -ForegroundColor White
+            
+            $page++
+            Start-Sleep -Milliseconds 300  # Rate limiting
+            
+        } catch {
+            Write-Warning "Error fetching projects page $page : $($_.Exception.Message)"
+            break
         }
         
-        if ($orgs.orgs.Count -eq 1) {
-            $OrgId = $orgs.orgs[0].id
-            Write-Host "Using organization: $($orgs.orgs[0].name)" -ForegroundColor Green
-        } else {
-            Write-Host "Multiple organizations found. Please specify -OrgId parameter." -ForegroundColor Red
-            exit 1
+    } while ($hasMore)
+    
+    Write-Host "Total projects retrieved: $($allProjects.Count)" -ForegroundColor Green
+    return $allProjects
+}
+
+# Function to get issues for all projects using REST API
+function Get-AllIssues {
+    param(
+        [string]$OrganizationId,
+        [array]$Projects
+    )
+    
+    Write-Host "Retrieving issues for $($Projects.Count) projects..." -ForegroundColor Yellow
+    
+    $allIssues = @()
+    $projectCount = 0
+    
+    foreach ($project in $Projects) {
+        $projectCount++
+        Write-Host "Processing project $projectCount/$($Projects.Count): $($project.name)" -ForegroundColor Green
+        
+        try {
+            $url = "$RestBaseUrl/org/$OrganizationId/project/$($project.id)/issues"
+            $response = Invoke-RestMethod -Uri $url -Headers $Headers -Method GET
+            
+            if ($response.issues) {
+                foreach ($issue in $response.issues) {
+                    # Add project information to each issue
+                    $issue | Add-Member -NotePropertyName "projectId" -NotePropertyValue $project.id
+                    $issue | Add-Member -NotePropertyName "projectName" -NotePropertyValue $project.name
+                    $issue | Add-Member -NotePropertyName "projectOrigin" -NotePropertyValue $project.origin
+                    $issue | Add-Member -NotePropertyName "projectType" -NotePropertyValue $project.type
+                    $issue | Add-Member -NotePropertyName "projectCreated" -NotePropertyValue $project.created
+                    $allIssues += $issue
+                }
+                Write-Host "  Found $($response.issues.Count) issues" -ForegroundColor White
+            } else {
+                Write-Host "  No issues found" -ForegroundColor Gray
+            }
+            
+            Start-Sleep -Milliseconds 200  # Rate limiting
+            
+        } catch {
+            Write-Warning "Error fetching issues for project $($project.name): $($_.Exception.Message)"
+            continue
         }
+    }
+    
+    Write-Host "Total issues retrieved: $($allIssues.Count)" -ForegroundColor Green
+    return $allIssues
+}
+
+# Function to convert projects to CSV format
+function ConvertTo-ProjectCSV {
+    param([array]$Projects)
+    
+    $csvData = @()
+    foreach ($project in $Projects) {
+        $csvData += [PSCustomObject]@{
+            ProjectId = $project.id
+            ProjectName = $project.name
+            Origin = $project.origin
+            Type = $project.type
+            Created = $project.created
+            IsMonitored = $project.isMonitored
+            TotalDependencies = $project.totalDependencies
+            CriticalIssues = $project.issueCountsBySeverity.critical
+            HighIssues = $project.issueCountsBySeverity.high
+            MediumIssues = $project.issueCountsBySeverity.medium
+            LowIssues = $project.issueCountsBySeverity.low
+            RemoteRepoUrl = $project.remoteRepoUrl
+            LastTestedDate = $project.lastTestedDate
+            BrowseUrl = $project.browseUrl
+        }
+    }
+    return $csvData
+}
+
+# Function to convert issues to CSV format
+function ConvertTo-IssueCSV {
+    param([array]$Issues)
+    
+    $csvData = @()
+    foreach ($issue in $Issues) {
+        $csvData += [PSCustomObject]@{
+            IssueId = $issue.id
+            Title = $issue.title
+            Type = $issue.type
+            Severity = $issue.severity
+            Priority = $issue.priorityScore
+            Package = $issue.package
+            Version = $issue.version
+            Language = $issue.language
+            PackageManager = $issue.packageManager
+            IsPatchable = $issue.isPatchable
+            IsUpgradable = $issue.isUpgradable
+            FixedIn = ($issue.fixedIn -join "; ")
+            UpgradePath = if ($issue.upgradePath) { ($issue.upgradePath -join " -> ") } else { "" }
+            CvssScore = $issue.cvssScore
+            CvssVector = $issue.CVSSv3
+            DisclosureTime = $issue.disclosureTime
+            PublicationTime = $issue.publicationTime
+            IntroducedDate = $issue.introducedDate
+            Credit = ($issue.credit -join "; ")
+            ProjectId = $issue.projectId
+            ProjectName = $issue.projectName
+            ProjectOrigin = $issue.projectOrigin
+            ProjectType = $issue.projectType
+            ProjectCreated = $issue.projectCreated
+        }
+    }
+    return $csvData
+}
+
+# Function to save data to CSV
+function Save-ToCSV {
+    param(
+        [array]$Data,
+        [string]$FileName
+    )
+    
+    if ($Data.Count -eq 0) {
+        Write-Warning "No data to save for $FileName"
+        return
+    }
+    
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $filePath = Join-Path $OutputPath "$FileName`_$timestamp.csv"
+    
+    try {
+        $Data | Export-Csv -Path $filePath -NoTypeInformation -Encoding UTF8
+        Write-Host "Saved $($Data.Count) records to: $filePath" -ForegroundColor Green
+    } catch {
+        Write-Error "Failed to save CSV: $($_.Exception.Message)"
+    }
+}
+
+# Main execution
+Write-Host "=== Snyk Data Extractor (Fixed Version) ===" -ForegroundColor Cyan
+
+# Test API connectivity first
+if (-not (Test-SnykAPI)) {
+    Write-Error "Cannot connect to Snyk API. Please check your token."
+    exit 1
+}
+
+# Get organizations
+$orgs = Get-Organizations
+if ($orgs.Count -eq 0) {
+    Write-Error "No organizations found"
+    exit 1
+}
+
+# Determine organization to use
+if (-not $OrgId) {
+    if ($orgs.Count -eq 1) {
+        $OrgId = $orgs[0].id
+        Write-Host "Using organization: $($orgs[0].name)" -ForegroundColor Green
     } else {
-        Write-Error "Failed to retrieve organizations"
+        Write-Host "Multiple organizations available. Please specify -OrgId parameter:" -ForegroundColor Yellow
+        foreach ($org in $orgs) {
+            Write-Host "  Use: -OrgId '$($org.id)' for '$($org.name)'" -ForegroundColor White
+        }
         exit 1
     }
+} else {
+    # Verify the provided OrgId exists
+    $selectedOrg = $orgs | Where-Object { $_.id -eq $OrgId }
+    if (-not $selectedOrg) {
+        Write-Error "Organization ID '$OrgId' not found. Available IDs: $($orgs.id -join ', ')"
+        exit 1
+    }
+    Write-Host "Using specified organization: $($selectedOrg.name)" -ForegroundColor Green
 }
 
-# Execute based on data type
-switch ($DataType) {
-    "organizations" {
-        $data = Get-SnykOrganizations
-        if ($data) {
-            Save-DataToFile -Data $data.orgs -FileName "snyk_organizations" -Format $OutputFormat
-        }
-    }
-    
-    "projects" {
-        $data = Get-SnykProjects -OrganizationId $OrgId
-        if ($data) {
-            Save-DataToFile -Data $data.projects -FileName "snyk_projects" -Format $OutputFormat
-        }
-    }
-    
-    "issues" {
-        $data = Get-SnykIssues -OrganizationId $OrgId
-        if ($data) {
-            Save-DataToFile -Data $data.issues -FileName "snyk_issues" -Format $OutputFormat
-        }
-    }
-    
-    "vulnerabilities" {
-        $projects = Get-SnykProjects -OrganizationId $OrgId
-        if ($projects -and $projects.projects) {
-            $allVulns = @()
-            foreach ($project in $projects.projects) {
-                $vulns = Get-SnykVulnerabilities -OrganizationId $OrgId -ProjectId $project.id
-                if ($vulns -and $vulns.issues) {
-                    foreach ($vuln in $vulns.issues) {
-                        $vuln | Add-Member -NotePropertyName "projectId" -NotePropertyValue $project.id
-                        $vuln | Add-Member -NotePropertyName "projectName" -NotePropertyValue $project.name
-                        $allVulns += $vuln
-                    }
-                }
-            }
-            Save-DataToFile -Data $allVulns -FileName "snyk_vulnerabilities" -Format $OutputFormat
-        }
-    }
-    
-    "dependencies" {
-        $projects = Get-SnykProjects -OrganizationId $OrgId
-        if ($projects -and $projects.projects) {
-            $allDeps = @()
-            foreach ($project in $projects.projects) {
-                $deps = Get-SnykDependencies -OrganizationId $OrgId -ProjectId $project.id
-                if ($deps) {
-                    $deps | Add-Member -NotePropertyName "projectId" -NotePropertyValue $project.id
-                    $deps | Add-Member -NotePropertyName "projectName" -NotePropertyValue $project.name
-                    $allDeps += $deps
-                }
-            }
-            Save-DataToFile -Data $allDeps -FileName "snyk_dependencies" -Format $OutputFormat
-        }
-    }
+# Create output directory
+if (!(Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 }
 
-Write-Host "=== Script Execution Complete ===" -ForegroundColor Cyan
+Write-Host "`nOrganization ID: $OrgId" -ForegroundColor Cyan
+Write-Host "Output Path: $OutputPath" -ForegroundColor Cyan
+
+# Extract Projects
+Write-Host "`n--- Extracting Projects ---" -ForegroundColor Magenta
+$projects = Get-AllProjects -OrganizationId $OrgId
+
+if ($projects.Count -gt 0) {
+    $projectCSV = ConvertTo-ProjectCSV -Projects $projects
+    Save-ToCSV -Data $projectCSV -FileName "snyk_projects"
+    
+    # Extract Issues
+    Write-Host "`n--- Extracting Issues ---" -ForegroundColor Magenta
+    $issues = Get-AllIssues -OrganizationId $OrgId -Projects $projects
+    
+    if ($issues.Count -gt 0) {
+        $issueCSV = ConvertTo-IssueCSV -Issues $issues
+        Save-ToCSV -Data $issueCSV -FileName "snyk_issues"
+    }
+} else {
+    Write-Warning "No projects found. Cannot extract issues."
+}
+
+Write-Host "`n=== Extraction Complete ===" -ForegroundColor Cyan
+Write-Host "Projects: $($projects.Count)" -ForegroundColor Green
+Write-Host "Issues: $(if($issues) {$issues.Count} else {0})" -ForegroundColor Green
