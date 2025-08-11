@@ -1,0 +1,56 @@
+# --- CONFIG ---
+$token = "YOUR_SNYK_API_TOKEN"
+$orgId = "YOUR_ORG_ID"
+$baseUrl = "https://api.snyk.io/rest"
+
+# API endpoints
+$endpoints = @(
+    @{ name = "projects"; url = "$baseUrl/orgs/$orgId/projects?limit=100" },
+    @{ name = "issues";   url = "$baseUrl/orgs/$orgId/issues?limit=100" },
+    @{ name = "orgs";     url = "$baseUrl/orgs?limit=100" },
+    @{ name = "assets";   url = "$baseUrl/orgs/$orgId/assets?limit=100" }
+)
+
+# Function to fetch all pages for an endpoint
+function Get-AllPages {
+    param (
+        [string]$url,
+        [string]$endpointName
+    )
+
+    $headers = @{
+        "Authorization" = "token $token"
+        "Content-Type"  = "application/json"
+    }
+
+    $results = @()
+    $nextUrl = $url
+
+    while ($null -ne $nextUrl) {
+        Write-Host "Fetching $endpointName page: $nextUrl" -ForegroundColor Cyan
+        $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET
+
+        # Append data
+        if ($response.data) {
+            $results += $response.data
+        }
+
+        # Handle pagination cursor
+        if ($response.links.next) {
+            $nextUrl = $response.links.next
+        }
+        else {
+            $nextUrl = $null
+        }
+    }
+
+    # Save to CSV (flattening JSON)
+    $csvPath = "$endpointName.csv"
+    $results | ConvertTo-Json -Depth 10 | ConvertFrom-Json | Export-Csv -Path $csvPath -NoTypeInformation
+    Write-Host "Saved $endpointName data to $csvPath" -ForegroundColor Green
+}
+
+# Loop over endpoints
+foreach ($ep in $endpoints) {
+    Get-AllPages -url $ep.url -endpointName $ep.name
+}
