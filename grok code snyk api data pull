@@ -1,0 +1,103 @@
+# PowerShell script to fetch data from Snyk REST API for Projects, Issues, Organizations, and Assets with pagination
+# Requires PowerShell 7 for ResponseHeadersVariable support
+
+# Configuration
+$ApiToken = "YOUR_SNYK_API_TOKEN"  # Replace with your Snyk API token
+$OrgId = "YOUR_ORG_ID"            # Replace with your Snyk Organization ID
+$ApiVersion = "2024-10-15"        # Recommended API version
+$BaseUrl = "https://api.snyk.io/rest"
+$OutputDir = "SnykData"           # Directory to store output JSON files
+$PageSize = 100                   # Number of records per page (max 100 for Snyk API)
+
+# Ensure output directory exists
+if (-not (Test-Path -Path $OutputDir)) {
+    New-Item -ItemType Directory -Path $OutputDir | Out-Null
+}
+
+# Headers for API requests
+$Headers = @{
+    "Content-Type"  = "application/vnd.api+json"
+    "Authorization" = "token $ApiToken"
+}
+
+# Function to handle paginated API requests
+function Get-PaginatedSnykData {
+    param (
+        [string]$Endpoint,
+        [string]$OutputFile,
+        [hashtable]$QueryParams = @{}
+    )
+
+    try {
+        $results = [System.Collections.ArrayList]@()
+        $uri = "$BaseUrl/$Endpoint"
+        $firstCall = $true
+        $pageCount = 0
+
+        Write-Host "Fetching data from $Endpoint..."
+
+        do {
+            # Add pagination parameters for subsequent calls
+            if (-not $firstCall) {
+                $uri = $nextLink
+            } else {
+                $QueryParams["version"] = $ApiVersion
+                $QueryParams["limit"] = $PageSize
+                $uri = "$uri`?" + ($QueryParams.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "&"
+            }
+
+            # Make API call
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $Headers -ResponseHeadersVariable responseHeaders
+
+            # Add data to results
+            if ($response.data) {
+                $results.AddRange($response.data)
+            }
+
+            # Get next link for pagination
+            $nextLink = $response.links.next
+            $firstCall = $false
+            $pageCount++
+            Write-Host "Fetched page $pageCount ($($results.Count) records so far)"
+
+        } while ($nextLink -and $nextLink -ne $uri)  # Continue until no next link or same as current (safety check)
+
+        # Save results to JSON file
+        $results | ConvertTo-Json -Depth 10 | Set-Content -Path "$OutputDir\$OutputFile"
+        Write-Host "Saved $($results.Count) records to $OutputDir\$OutputFile"
+    }
+    catch {
+        Write-Error "Error fetching data from $Endpoint : $_"
+    }
+}
+
+# Define API endpoints and corresponding output files
+$endpoints = @(
+    @{
+        Endpoint = "orgs/$OrgId/projects"
+        OutputFile = "Projects.json"
+        QueryParams = @{}
+    },
+    @{
+        Endpoint = "orgs/$OrgId/issues"
+        OutputFile = "Issues.json"
+        QueryParams = @{}
+    },
+    @{
+        Endpoint = "orgs"
+        OutputFile = "Organizations.json"
+        QueryParams = @{}
+    },
+    @{
+        Endpoint = "orgs/$OrgId/assets"
+        OutputFile = "Assets.json"
+        QueryParams = @{}
+    }
+)
+
+# Fetch data for each endpoint
+foreach ($endpoint in $endpoints) {
+    Get-PaginatedSnykData -Endpoint $endpoint.Endpoint -OutputFile $endpoint.OutputFile -QueryParams $endpoint.QueryParams
+}
+
+Write-Host "Data retrieval complete. Check $OutputDir for output files."
