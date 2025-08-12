@@ -6,15 +6,11 @@ function Flatten-Object {
     )
 
     $flat = @{}
-
     foreach ($key in $Object.Keys) {
         $value = $Object[$key]
         $newKey = if ($Prefix) { "$Prefix.$key" } else { $key }
 
-        if ($value -is [hashtable]) {
-            $flat += Flatten-Object -Object $value -Prefix $newKey
-        }
-        elseif ($value -is [System.Collections.IDictionary]) {
+        if ($value -is [hashtable] -or $value -is [System.Collections.IDictionary]) {
             $flat += Flatten-Object -Object $value -Prefix $newKey
         }
         elseif ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
@@ -24,18 +20,16 @@ function Flatten-Object {
             $flat[$newKey] = $value
         }
     }
-
     return $flat
 }
 
-# API setup
 $headers = @{
     "Authorization" = "token <your_token>"   # Replace with your token
     "Content-Type"  = "application/json"
 }
 
 $results = @()
-$orgId   = "<your_org_id>"                   # Replace with your org ID
+$orgId   = "<your_org_id>"
 $version = "2025-08-01"
 
 $nextUrl = "https://api.snyk.io/rest/orgs/$orgId/projects?limit=100&version=$version"
@@ -44,8 +38,14 @@ while ($null -ne $nextUrl) {
     Write-Host "Fetching: $nextUrl"
     $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET
 
-    if ($response.data) {
-        foreach ($item in $response.data) {
+    # Auto-detect main array key
+    $mainKey = $response.PSObject.Properties.Name | Where-Object {
+        $response.$_ -is [System.Collections.IEnumerable] -and
+        $response.$_ -isnot [string]
+    } | Select-Object -First 1
+
+    if ($mainKey) {
+        foreach ($item in $response.$mainKey) {
             $flatItem = Flatten-Object -Object ($item | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable)
             $results += [PSCustomObject]$flatItem
         }
@@ -62,7 +62,6 @@ while ($null -ne $nextUrl) {
     }
 }
 
-# Export to CSV
 $csvPath = "C:\Users\<user>\OneDrive - Thrivent\Work\GitHub\snyk_projects_flat.csv"
 $results | Export-Csv -Path $csvPath -NoTypeInformation -Force
 
