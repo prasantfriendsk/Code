@@ -1,0 +1,69 @@
+function Flatten-Object {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Object,
+        [string]$Prefix = ""
+    )
+
+    $flat = @{}
+
+    foreach ($key in $Object.Keys) {
+        $value = $Object[$key]
+        $newKey = if ($Prefix) { "$Prefix.$key" } else { $key }
+
+        if ($value -is [hashtable]) {
+            $flat += Flatten-Object -Object $value -Prefix $newKey
+        }
+        elseif ($value -is [System.Collections.IDictionary]) {
+            $flat += Flatten-Object -Object $value -Prefix $newKey
+        }
+        elseif ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+            $flat[$newKey] = ($value -join ", ")
+        }
+        else {
+            $flat[$newKey] = $value
+        }
+    }
+
+    return $flat
+}
+
+# API setup
+$headers = @{
+    "Authorization" = "token <your_token>"   # Replace with your token
+    "Content-Type"  = "application/json"
+}
+
+$results = @()
+$orgId   = "<your_org_id>"                   # Replace with your org ID
+$version = "2025-08-01"
+
+$nextUrl = "https://api.snyk.io/rest/orgs/$orgId/projects?limit=100&version=$version"
+
+while ($null -ne $nextUrl) {
+    Write-Host "Fetching: $nextUrl"
+    $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET
+
+    if ($response.data) {
+        foreach ($item in $response.data) {
+            $flatItem = Flatten-Object -Object ($item | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable)
+            $results += [PSCustomObject]$flatItem
+        }
+    }
+
+    if ($response.links.next) {
+        if ($response.links.next -match "^/") {
+            $nextUrl = "https://api.snyk.io" + $response.links.next
+        } else {
+            $nextUrl = $response.links.next
+        }
+    } else {
+        $nextUrl = $null
+    }
+}
+
+# Export to CSV
+$csvPath = "C:\Users\<user>\OneDrive - Thrivent\Work\GitHub\snyk_projects_flat.csv"
+$results | Export-Csv -Path $csvPath -NoTypeInformation -Force
+
+Write-Host "Flattened export complete: $csvPath"
