@@ -1,3 +1,33 @@
+function ConvertTo-Hashtable {
+    param (
+        [Parameter(Mandatory = $true)]
+        [psobject]$Object
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    $hash = @{}
+    foreach ($prop in $Object.PSObject.Properties) {
+        if ($prop.Value -is [psobject]) {
+            $hash[$prop.Name] = ConvertTo-Hashtable -Object $prop.Value
+        }
+        elseif ($prop.Value -is [System.Collections.IEnumerable] -and $prop.Value -isnot [string]) {
+            $hash[$prop.Name] = @()
+            foreach ($item in $prop.Value) {
+                if ($item -is [psobject]) {
+                    $hash[$prop.Name] += , (ConvertTo-Hashtable -Object $item)
+                } else {
+                    $hash[$prop.Name] += , $item
+                }
+            }
+        }
+        else {
+            $hash[$prop.Name] = $prop.Value
+        }
+    }
+    return $hash
+}
+
 function Flatten-Object {
     param(
         [Parameter(Mandatory=$true)]
@@ -10,7 +40,7 @@ function Flatten-Object {
         $value = $Object[$key]
         $newKey = if ($Prefix) { "$Prefix.$key" } else { $key }
 
-        if ($value -is [hashtable] -or $value -is [System.Collections.IDictionary]) {
+        if ($value -is [hashtable]) {
             $flat += Flatten-Object -Object $value -Prefix $newKey
         }
         elseif ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
@@ -46,7 +76,8 @@ while ($null -ne $nextUrl) {
 
     if ($mainKey) {
         foreach ($item in $response.$mainKey) {
-            $flatItem = Flatten-Object -Object ($item | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable)
+            $hashItem = ConvertTo-Hashtable -Object $item
+            $flatItem = Flatten-Object -Object $hashItem
             $results += [PSCustomObject]$flatItem
         }
     }
