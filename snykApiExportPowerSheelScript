@@ -1,0 +1,64 @@
+# ===============================
+# Snyk Export API - PowerShell Script
+# Automates: initiate -> poll -> download
+# ===============================
+
+# --- CONFIGURATION ---
+$token   = "<YOUR_SNYK_API_TOKEN>"     # API Token
+$groupId = "<YOUR_GROUP_ID>"           # Replace with your Snyk Group ID
+$outFile = "snyk_export.csv"           # Local file to save CSV
+$version = "2024-10-15"                # Recommended API version
+
+# --- 1. INITIATE EXPORT ---
+$exportBody = @{
+    filters = @{
+        severities = @("high","critical")   # Example filter
+    }
+    columns = @(
+        "PROJECT_NAME",
+        "ISSUE_ID",
+        "CVE",
+        "SEVERITY",
+        "PACKAGE",
+        "VERSION"
+    )
+} | ConvertTo-Json -Depth 10
+
+$headers = @{
+    "Authorization" = "token $token"
+    "Content-Type"  = "application/json"
+    "Accept"        = "application/json; version=$version"
+}
+
+Write-Host "Initiating export job..."
+$response = Invoke-RestMethod -Uri "https://api.snyk.io/rest/groups/$groupId/export" `
+    -Method POST -Headers $headers -Body $exportBody
+
+$exportId = $response.id
+Write-Host "Export initiated. Job ID:" $exportId
+
+# --- 2. POLL FOR STATUS ---
+$jobStatus = "PENDING"
+while ($jobStatus -ne "FINISHED" -and $jobStatus -ne "ERROR") {
+    Start-Sleep -Seconds 10
+    $statusResponse = Invoke-RestMethod -Uri "https://api.snyk.io/rest/groups/$groupId/jobs/export/$exportId" `
+        -Headers $headers -Method GET
+    $jobStatus = $statusResponse.status
+    Write-Host "Export status:" $jobStatus
+}
+
+if ($jobStatus -eq "ERROR") {
+    Write-Error "Export job failed!"
+    exit 1
+}
+
+# --- 3. FETCH DOWNLOAD LINK ---
+$linkResponse = Invoke-RestMethod -Uri "https://api.snyk.io/rest/groups/$groupId/export/$exportId" `
+    -Headers $headers -Method GET
+
+$downloadUrl = $linkResponse.url
+Write-Host "Download URL (valid 60 mins): $downloadUrl"
+
+# --- 4. DOWNLOAD CSV ---
+Invoke-WebRequest -Uri $downloadUrl -OutFile $outFile
+Write-Host "Export downloaded to $outFile ✅"
