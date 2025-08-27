@@ -1,0 +1,156 @@
+<#
+.SYNOPSIS
+  Start a Snyk Export API job, wait for completion, and download the CSV(s).
+
+.EXAMPLE
+  # Org export (US default region)
+  .\Invoke-SnykExport.ps1 -OrgId "00000000-0000-0000-0000-000000000000" `
+    -Token $env:SNYK_TOKEN `
+    -UpdatedFrom (Get-Date).AddDays(-30) `
+    -OutDir ".\snyk-export\org"
+
+.EXAMPLE
+  # Group export (US-02 region) for last 7 days
+  .\Invoke-SnykExport.ps1 -GroupId "11111111-1111-1111-1111-111111111111" `
+    -BaseUrl "https://api.us.snyk.io" `
+    -Token $env:SNYK_TOKEN `
+    -UpdatedFrom (Get-Date).AddDays(-7) `
+    -OutDir ".\snyk-export\group"
+
+#>
+
+[CmdletBinding(DefaultParameterSetName='Org')]
+param(
+  # Scope (choose one)
+  [Parameter(Mandatory=$true, ParameterSetName='Org')]
+  [string]$OrgId,
+  [Parameter(Mandatory=$true, ParameterSetName='Group')]
+  [string]$GroupId,
+
+  # Auth & endpoint
+  [string]$Token = $env:SNYK_TOKEN,
+  [string]$BaseUrl = "https://api.snyk.io",           # e.g., https://api.us.snyk.io for us-02
+  [string]$Version = "2024-10-15",                    # latest REST API version for Export
+
+  # Export shape
+  [ValidateSet('issues','usage')]
+  [string]$Dataset = "issues",
+
+  # Required date filter for Export API (default: last 30 days on 'updated')
+  [datetime]$UpdatedFrom = (Get-Date).AddDays(-30),
+  [datetime]$UpdatedTo   = (Get-Date),
+
+  # Optional: choose columns (omit or trim as you like)
+  [string[]]$Columns = @(
+    "ISSUE_SEVERITY","PROBLEM_TITLE","PROJECT_NAME","ISSUE_URL",
+    "CVE","CWE","ISSUE_TYPE","ISSUE_STATUS_INDICATOR",
+    "EXPLOIT_MATURITY","AUTOFIXABLE","FIRST_INTRODUCED",
+    "SCORE","PRODUCT_NAME","PROJECT_URL"
+  ),
+
+  # Runtime knobs
+  [string]$OutDir = ".\snyk-export",
+  [int]$PollSeconds = 5,
+  [int]$TimeoutMinutes = 30
+)
+
+# --- Validate inputs
+if ([string]::IsNullOrWhiteSpace($Token)) {
+  throw "Snyk API token not provided. Pass -Token or set `$env:SNYK_TOKEN."
+}
+
+# Normalize times to UTC in required format
+$uFrom = $UpdatedFrom.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$uTo   = $UpdatedTo.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+# Build JSON:API payload
+$bodyObj = @{
+  data = @{
+    type = "resource"
+    attributes = @{
+      dataset = $Dataset
+      columns = $Columns
+      filters = @{
+        updated = @{
+          from = $uFrom
+          to   = $uTo
+        }
+      }
+      formats = @("csv")
+    }
+  }
+}
+$bodyJson = $bodyObj | ConvertTo-Json -Depth 8
+
+$headers = @{
+  "Authorization" = "token $Token"
+  "Content-Type"  = "application/vnd.api+json"
+  "Accept"        = "application/json"
+}
+
+# Scope-aware paths
+$scopePath = if ($PSCmdlet.ParameterSetName -eq 'Org') { "/rest/orgs/$OrgId" } else { "/rest/groups/$GroupId" }
+$startUri  = "$BaseUrl$scopePath/export?version=$Version"
+
+Write-Host "Starting Snyk export ($Dataset)..." -ForegroundColor Cyan
+$response = Invoke-RestMethod -Method POST -Uri $startUri -Headers $headers -Body $bodyJson
+
+# Extract export job id (robustly from links.self)
+$jobLink = $response.links.self
+if (-not $jobLink) { throw "Unexpected response: 'links.self' missing.`n$($response | ConvertTo-Json -Depth 6)" }
+$exportId = ($jobLink -split '/jobs/|/export/|/results/|/')[ -1 ]
+if (-not $exportId -or $exportId -notmatch '^[0-9a-f-]+$') {
+  throw "Could not parse export id from links.self: $jobLink"
+}
+
+# Poll status
+$statusUri = "$BaseUrl$scopePath/jobs/export/$exportId?version=$Version"
+$deadline  = (Get-Date).AddMinutes($TimeoutMinutes)
+
+do {
+  Start-Sleep -Seconds $PollSeconds
+  $statusResp = Invoke-RestMethod -Method GET -Uri $statusUri -Headers $headers
+  $status = $statusResp.data.attributes.status
+  Write-Host "Status: $status"
+  if ($status -eq 'FAILED' -or $status -eq 'ERROR') {
+    $err = $statusResp.data.attributes.errors
+    throw ("Export job failed. Details: " + ($err | ConvertTo-Json -Depth 6))
+  }
+} while ($status -ne 'FINISHED' -and (Get-Date) -lt $deadline)
+
+if ($status -ne 'FINISHED') {
+  throw "Timed out after $TimeoutMinutes minutes waiting for export job $exportId."
+}
+
+# Fetch results
+$resultsUri = "$BaseUrl$scopePath/export/$exportId?version=$Version"
+$resultsResp = Invoke-RestMethod -Method GET -Uri $resultsUri -Headers $headers
+
+# Ensure output folder exists
+$null = New-Item -ItemType Directory -Path $OutDir -Force
+
+# Download each file in results
+$downloads = @()
+$items = $resultsResp.data.attributes.results
+if (-not $items) { Write-Warning "Export finished but 'results' was empty."; }
+
+foreach ($item in $items) {
+  # Try common fields for the pre-signed URL and filename
+  $url  = $item.location; if (-not $url) { $url = $item.url }
+  if (-not $url -and $item.links) { $url = $item.links.download }
+  $name = $item.file_name
+  if (-not $url) {
+    Write-Warning "Unknown results schema:`n$($item | ConvertTo-Json -Depth 6)"
+    continue
+  }
+  if (-not $name) {
+    try { $name = ([Uri]$url).Segments[-1] } catch { $name = "export-$exportId-$([guid]::NewGuid().Guid).csv" }
+  }
+  $outFile = Join-Path $OutDir $name
+  Write-Host "Downloading $name ..."
+  Invoke-WebRequest -Uri $url -OutFile $outFile
+  $downloads += $outFile
+}
+
+Write-Host "`nDone. Files downloaded to: $OutDir" -ForegroundColor Green
+$downloads | ForEach-Object { Write-Host " - $_" }
