@@ -1,0 +1,256 @@
+<#  Snyk Export (PS 5.1 compatible, hardened poller)
+    - Uses server-returned job link AS-IS for polling
+    - Logs HTTP code and raw body snippet if status isn't found
+    - Aligns ?version= with what the server returns
+#>
+
+[CmdletBinding(DefaultParameterSetName='Org')]
+param(
+  [Parameter(Mandatory=$true, ParameterSetName='Org')]
+  [string]$OrgId,
+
+  [Parameter(Mandatory=$true, ParameterSetName='Group')]
+  [string]$GroupId,
+
+  [string]$Token = $env:SNYK_TOKEN,
+  [string]$BaseUrl = "https://api.snyk.io",  # us-01; use https://api.us.snyk.io (us-02) or https://api.eu.snyk.io (EU)
+  [string]$Version = "2024-10-15",
+
+  [ValidateSet('issues','usage')]
+  [string]$Dataset = "issues",
+
+  [datetime]$UpdatedFrom = (Get-Date).AddDays(-30),
+  [datetime]$UpdatedTo   = (Get-Date),
+
+  [string[]]$Columns,
+
+  [string]$OutDir = ".\snyk-export",
+  [int]$PollSeconds = 10,
+  [int]$TimeoutMinutes = 60,
+
+  [switch]$Combine,
+  [string]$CombinedOutFile = "export_combined.csv",
+
+  # When set, prints the first ~800 chars of every poll response body.
+  [switch]$VerbosePoll
+)
+
+function Resolve-AbsoluteUrl {
+  param([string]$Base, [string]$MaybeRelative)
+  if ([string]::IsNullOrWhiteSpace($MaybeRelative)) { return $null }
+  if ($MaybeRelative.StartsWith("http")) { return $MaybeRelative }
+  if ($MaybeRelative.StartsWith("/"))   { return ($Base.TrimEnd('/') + $MaybeRelative) }
+  return ($Base.TrimEnd('/') + '/' + $MaybeRelative.TrimStart('/'))
+}
+function Extract-QueryVersion {
+  param([string]$Url)
+  if ($Url -match '(?:\?|&)version=([^&]+)') { return $Matches[1] } else { return $null }
+}
+function Extract-ExportId {
+  param([string]$Url)
+  if ($Url -match '/jobs/export/([^/?]+)') { return $Matches[1] } else { return $null }
+}
+function Ensure-Dir {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { $null = New-Item -ItemType Directory -Path $Path -Force }
+}
+function Download-ResultFile {
+  param([string]$Url, [string]$FileName, [string]$TargetDir)
+  Ensure-Dir -Path $TargetDir
+  $outFile = Join-Path $TargetDir $FileName
+  Write-Host "Downloading $FileName ..."
+  Invoke-WebRequest -Uri $Url -OutFile $outFile -UseBasicParsing -ErrorAction Stop
+  return $outFile
+}
+
+if ([string]::IsNullOrWhiteSpace($Token)) {
+  throw "Snyk API token not provided. Pass -Token or set `$env:SNYK_TOKEN."
+}
+
+$scopePath = if ($PSCmdlet.ParameterSetName -eq 'Org') { "/orgs/$OrgId" } else { "/groups/$GroupId" } # NOTE: no /rest here intentionally for links
+$restScope = "/rest$($scopePath)"  # used only for the initial POST
+
+$headers = @{
+  "Authorization" = "token $Token"
+  "Accept"        = "application/vnd.api+json"
+}
+
+$uFrom = $UpdatedFrom.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$uTo   = $UpdatedTo.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+$attrs = @{
+  dataset = $Dataset
+  formats = @("csv")
+  filters = @{ updated = @{ from = $uFrom; to = $uTo } }
+}
+if ($PSBoundParameters.ContainsKey('Columns') -and $Columns -and $Columns.Count -gt 0) {
+  $attrs.columns = $Columns
+}
+$bodyObj  = @{ data = @{ type = "resource"; attributes = $attrs } }
+$bodyJson = $bodyObj | ConvertTo-Json -Depth 12
+
+# --- Start export (use WebRequest for headers) ---
+$startUri = "$BaseUrl$restScope/export?version=$Version"
+Write-Host "Starting Snyk export ($Dataset) at $startUri" -ForegroundColor Cyan
+
+try {
+  $startRaw = Invoke-WebRequest -Method POST -Uri $startUri -Headers $headers `
+              -Body $bodyJson -ContentType "application/vnd.api+json" -UseBasicParsing -ErrorAction Stop
+} catch {
+  $msg = $_.ErrorDetails?.Message; if (-not $msg) { $msg = $_.Exception.Message }
+  throw "Export start failed: $msg"
+}
+
+$startResp = $null
+if ($startRaw.Content) { try { $startResp = $startRaw.Content | ConvertFrom-Json -Depth 12 } catch { } }
+
+# Prefer body.data.links.self (often relative), then Location header, then body.links.self, then fallback using id
+$jobLink = $null
+if ($startResp -and $startResp.data -and $startResp.data.links -and $startResp.data.links.self) {
+  $jobLink = $startResp.data.links.self
+} elseif ($startRaw.Headers -and $startRaw.Headers.Location) {
+  $jobLink = $startRaw.Headers.Location
+} elseif ($startResp -and $startResp.links -and $startResp.links.self) {
+  $jobLink = $startResp.links.self
+} elseif ($startResp -and $startResp.data -and $startResp.data.id) {
+  $jobLink = "$scopePath/jobs/export/$($startResp.data.id)?version=$Version"
+}
+
+if (-not $jobLink) { throw "Unexpected export start response; couldn't find job link. Body:`n$($startRaw.Content)" }
+
+$jobLink = Resolve-AbsoluteUrl -Base $BaseUrl -MaybeRelative $jobLink
+
+# Align API version to what the server returned in the link, if present
+$verFromLink = Extract-QueryVersion -Url $jobLink
+if ($verFromLink) { $Version = $verFromLink }
+
+# Export ID (for nicer logs; not strictly required)
+$exportId = Extract-ExportId -Url $jobLink
+if (-not $exportId) { $exportId = "(unknown)" }
+
+# Use the server-provided job link AS-IS for polling; derive results from it
+if ($jobLink -notmatch '/jobs/export/') { throw "Unexpected job link format: $jobLink" }
+$statusUri  = $jobLink
+$resultsUri = $jobLink -replace '/jobs/export/', '/export/'
+
+Write-Host "Job: $exportId (version $Version)" -ForegroundColor DarkCyan
+Write-Host "Polling: $statusUri"
+
+# --- Poll status (instrumented) ---
+$deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+$status = $null
+$lastRaw = $null
+
+do {
+  Start-Sleep -Seconds $PollSeconds
+  try {
+    $pollRaw = Invoke-WebRequest -Method GET -Uri $statusUri -Headers $headers -UseBasicParsing -ErrorAction Stop
+    $lastRaw = $pollRaw
+    $content = $pollRaw.Content
+    $json = $null
+    if ($content) { try { $json = $content | ConvertFrom-Json -Depth 20 } catch { } }
+
+    # Try multiple shapes
+    $status = $null
+    if ($json) {
+      if ($json.data -and $json.data.attributes -and $json.data.attributes.status) {
+        $status = $json.data.attributes.status
+      } elseif ($json.data -is [array] -and $json.data.Count -gt 0 -and $json.data[0].attributes.status) {
+        $status = $json.data[0].attributes.status
+      } elseif ($json.attributes -and $json.attributes.status) {
+        $status = $json.attributes.status
+      } elseif ($json.status) {
+        $status = $json.status
+      }
+    }
+
+    if ($status) {
+      Write-Host ("Status: {0} (HTTP {1})" -f $status, $pollRaw.StatusCode)
+      if ($status -in @('FAILED','ERROR','CANCELLED')) {
+        $err = $json?.data?.attributes?.errors
+        throw ("Export job reported $status. Details: " + ($err | ConvertTo-Json -Depth 12))
+      }
+    } else {
+      Write-Host ("Status: <unparsed> (HTTP {0})" -f $pollRaw.StatusCode)
+      $snippet = if ($content) { $content.Substring(0,[Math]::Min(800,$content.Length)) } else { "<no body>" }
+      if ($VerbosePoll) { Write-Host ("Body: {0}" -f $snippet) }
+    }
+  } catch {
+    $msg = $_.ErrorDetails?.Message; if (-not $msg) { $msg = $_.Exception.Message }
+    throw "Status check failed: $msg"
+  }
+} while (($status -ne 'FINISHED') -and (Get-Date) -lt $deadline)
+
+if ($status -ne 'FINISHED') {
+  $tail = $lastRaw?.Content
+  $tailSnippet = if ($tail) { $tail.Substring(0,[Math]::Min(800,$tail.Length)) } else { "<no body>" }
+  throw "Timed out after $TimeoutMinutes minutes waiting for export job $exportId. Last polled: $statusUri`nLast body snippet:`n$tailSnippet"
+}
+
+# --- Get results & download ---
+try {
+  $resultsRaw = Invoke-WebRequest -Method GET -Uri $resultsUri -Headers $headers -UseBasicParsing -ErrorAction Stop
+  $results = $resultsRaw.Content | ConvertFrom-Json -Depth 20
+} catch {
+  $msg = $_.ErrorDetails?.Message; if (-not $msg) { $msg = $_.Exception.Message }
+  throw "Fetching results failed: $msg"
+}
+
+$items = $results.data.attributes.results
+if (-not $items -or $items.Count -eq 0) {
+  Write-Warning "Export finished but 'results' is empty."
+  return
+}
+
+Ensure-Dir -Path $OutDir
+$downloaded = @()
+
+foreach ($item in $items) {
+  $url = $item.location; if (-not $url) { $url = $item.url }
+  if (-not $url -and $item.links -and $item.links.download) { $url = $item.links.download }
+  if (-not $url) { Write-Warning "Unknown results schema:`n$($item | ConvertTo-Json -Depth 12)"; continue }
+
+  $name = $item.file_name
+  if (-not $name) { try { $name = ([Uri]$url).Segments[-1] } catch { $name = "export-$exportId-$([guid]::NewGuid().Guid).csv" } }
+
+  $absUrl = Resolve-AbsoluteUrl -Base $BaseUrl -MaybeRelative $url
+  $downloaded += (Download-ResultFile -Url $absUrl -FileName $name -TargetDir $OutDir)
+}
+
+Write-Host "`nDownloaded files:" -ForegroundColor Green
+$downloaded | ForEach-Object { Write-Host " - $_" }
+
+if ($Combine -and $downloaded.Count -gt 0) {
+  Write-Host "`nCombining CSVs into $CombinedOutFile ..." -ForegroundColor Cyan
+  $allHeaders = New-Object System.Collections.Generic.HashSet[string]
+  foreach ($f in $downloaded) {
+    try {
+      $firstLine = (Get-Content -LiteralPath $f -TotalCount 1)
+      if ($firstLine) {
+        $cols = $firstLine -split ',(?=(?:[^"]*"[^"]*")*[^"]*$)'
+        foreach ($c in $cols) { [void]$allHeaders.Add($c.Trim('"')) }
+      }
+    } catch { }
+  }
+  $headerArray = @($allHeaders)
+  if ($headerArray.Count -gt 0) {
+    $combined = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $downloaded) {
+      try {
+        $rows = Import-Csv -LiteralPath $f
+        foreach ($r in $rows) {
+          $obj = New-Object PSObject
+          foreach ($h in $headerArray) { $null = Add-Member -InputObject $obj -MemberType NoteProperty -Name $h -Value ($r.$h) -Force }
+          $combined.Add($obj) | Out-Null
+        }
+      } catch { Write-Warning "Failed to read $f: $($_.Exception.Message)" }
+    }
+    $combinedPath = Join-Path $OutDir $CombinedOutFile
+    $combined | Export-Csv -LiteralPath $combinedPath -NoTypeInformation
+    Write-Host "Combined CSV written: $combinedPath" -ForegroundColor Green
+  } else {
+    Write-Warning "Could not detect headers; skipping combine."
+  }
+}
+
+Write-Host "`nDone." -ForegroundColor Green
