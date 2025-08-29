@@ -42,14 +42,14 @@ function Resolve-AbsoluteUrl { param([string]$Base,[string]$Rel)
   if ($Rel.StartsWith('/'))    { return $Base.TrimEnd('/') + $Rel }
   return $Base.TrimEnd('/') + '/' + $Rel.TrimStart('/')
 }
-
 function Extract-QueryVersion { param([string]$Url)
   if ($Url -match '(?:\?|&)version=([^&]+)') { return $Matches[1] } else { return $null }
 }
-# Export id for nicer logs (optional)
 function Extract-ExportId { param([string]$Url)
   if ($Url -match '/jobs/export/([^/?]+)') { return $Matches[1] } else { return $null }
 }
+
+
 function Ensure-Dir {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { $null = New-Item -ItemType Directory -Path $Path -Force }
@@ -102,61 +102,61 @@ try {
 }
 
 # --- Parse JSON body (already have: $startRaw, $bodyJson, $headers, $BaseUrl, $Version, $scopePath) ---
+# --- Parse JSON body (keep raw for regex) ---
+$raw = $startRaw.Content
 $startResp = $null
-if ($startRaw.Content) { try { $startResp = $startRaw.Content | ConvertFrom-Json -Depth 20 } catch { } }
+if ($raw) { try { $startResp = $raw | ConvertFrom-Json -Depth 20 } catch {} }
 
-# Extract job link robustly (PS 5.1 safe)
+# --- Extract job link robustly (regex first, then fallbacks) ---
 $jobLink = $null
+$exportId = $null
 
-# 1) Body: data.links.self  (use quoted member to avoid edge cases)
-try {
-  if ($startResp -and $startResp.data -and $startResp.data.links) {
-    $tmp = $startResp.data.links.'self'
-    if ($tmp) { $jobLink = $tmp }
-  }
-} catch {}
+# 1) Regex grab of data.links.self (PS 5.1-safe no matter the dynamic member weirdness)
+if ($raw -match '"links"\s*:\s*\{\s*"self"\s*:\s*"([^"]+)"') {
+  $jobLink = $Matches[1]
+}
 
-# 2) Body: links.self (alternate tenants)
-if (-not $jobLink) {
+# 2) If link still not found, try to pull id via regex and rebuild
+if (-not $jobLink -and $raw -match '"id"\s*:\s*"([0-9a-f-]{36})"') {
+  $exportId = $Matches[1]
+  $jobLink = "/$($scopePath.TrimStart('/'))/jobs/export/$exportId?version=$Version"
+}
+
+# 3) Last-chance: try object access (if ConvertFrom-Json worked)
+if (-not $jobLink -and $startResp) {
   try {
-    if ($startResp -and $startResp.links) {
-      $tmp = $startResp.links.'self'
-      if ($tmp) { $jobLink = $tmp }
-    }
+    $tmp = $startResp.data.links.'self'; if ($tmp) { $jobLink = $tmp }
   } catch {}
-}
-
-# 3) Location header
-if (-not $jobLink -and $startRaw.Headers -and $startRaw.Headers.Location) {
-  $jobLink = $startRaw.Headers.Location
-}
-
-# 4) Rebuild from id as last resort (NOTE: no /rest here; we’ll normalize below)
-if (-not $jobLink -and $startResp -and $startResp.data -and $startResp.data.id) {
-  $jobLink = "/$($scopePath.TrimStart('/'))/jobs/export/$($startResp.data.id)?version=$Version"
+  if (-not $jobLink) {
+    try { $tmp = $startResp.links.'self'; if ($tmp) { $jobLink = $tmp } } catch {}
+  }
+  if (-not $jobLink -and -not $exportId) {
+    try { $exportId = $startResp.data.id } catch {}
+    if ($exportId) { $jobLink = "/$($scopePath.TrimStart('/'))/jobs/export/$exportId?version=$Version" }
+  }
 }
 
 if (-not $jobLink) {
-  throw "Unexpected export start response; couldn't find job link. Body:`n$($startRaw.Content)"
+  throw "Unexpected export start response; couldn't find job link. Body:`n$raw"
 }
 
+# --- Normalize to absolute URL & align API version from the link ---
 
 
-$jobLink = Resolve-AbsoluteUrl -Base $BaseUrl -Rel $jobLink
-$verFromLink = Extract-QueryVersion -Url $jobLink
-if ($verFromLink) { $Version = $verFromLink }
-
-
-$exportId = Extract-ExportId -Url $jobLink
+$jobLink  = Resolve-AbsoluteUrl -Base $BaseUrl -Rel $jobLink
+$verFrom  = Extract-QueryVersion -Url $jobLink
+if ($verFrom) { $Version = $verFrom }
+if (-not $exportId) { $exportId = Extract-ExportId -Url $jobLink }
 if (-not $exportId) { $exportId = "(unknown)" }
 
-# Use the server-provided job link AS-IS for polling; derive results from it
+# --- Use server link AS-IS for polling; derive results from it ---
 if ($jobLink -notmatch '/jobs/export/') { throw "Unexpected job link format: $jobLink" }
 $statusUri  = $jobLink
 $resultsUri = $jobLink -replace '/jobs/export/', '/export/'
 
 Write-Host "Job: $exportId (version $Version)" -ForegroundColor DarkCyan
 Write-Host "Polling: $statusUri"
+
 
 
 # --- Poll status (instrumented) ---
