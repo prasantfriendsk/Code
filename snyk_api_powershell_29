@@ -35,19 +35,19 @@ param(
   [switch]$VerbosePoll
 )
 
-function Resolve-AbsoluteUrl {
-  param([string]$Base, [string]$MaybeRelative)
-  if ([string]::IsNullOrWhiteSpace($MaybeRelative)) { return $null }
-  if ($MaybeRelative.StartsWith("http")) { return $MaybeRelative }
-  if ($MaybeRelative.StartsWith("/"))   { return ($Base.TrimEnd('/') + $MaybeRelative) }
-  return ($Base.TrimEnd('/') + '/' + $MaybeRelative.TrimStart('/'))
+# Normalize to absolute URL and align to API version the server returned
+function Resolve-AbsoluteUrl { param([string]$Base,[string]$Rel)
+  if ([string]::IsNullOrWhiteSpace($Rel)) { return $null }
+  if ($Rel.StartsWith('http')) { return $Rel }
+  if ($Rel.StartsWith('/'))    { return $Base.TrimEnd('/') + $Rel }
+  return $Base.TrimEnd('/') + '/' + $Rel.TrimStart('/')
 }
-function Extract-QueryVersion {
-  param([string]$Url)
+
+function Extract-QueryVersion { param([string]$Url)
   if ($Url -match '(?:\?|&)version=([^&]+)') { return $Matches[1] } else { return $null }
 }
-function Extract-ExportId {
-  param([string]$Url)
+# Export id for nicer logs (optional)
+function Extract-ExportId { param([string]$Url)
   if ($Url -match '/jobs/export/([^/?]+)') { return $Matches[1] } else { return $null }
 }
 function Ensure-Dir {
@@ -101,30 +101,52 @@ try {
   throw "Export start failed: $msg"
 }
 
+# --- Parse JSON body (already have: $startRaw, $bodyJson, $headers, $BaseUrl, $Version, $scopePath) ---
 $startResp = $null
-if ($startRaw.Content) { try { $startResp = $startRaw.Content | ConvertFrom-Json -Depth 12 } catch { } }
+if ($startRaw.Content) { try { $startResp = $startRaw.Content | ConvertFrom-Json -Depth 20 } catch { } }
 
-# Prefer body.data.links.self (often relative), then Location header, then body.links.self, then fallback using id
+# Extract job link robustly (PS 5.1 safe)
 $jobLink = $null
-if ($startResp -and $startResp.data -and $startResp.data.links -and $startResp.data.links.self) {
-  $jobLink = $startResp.data.links.self
-} elseif ($startRaw.Headers -and $startRaw.Headers.Location) {
-  $jobLink = $startRaw.Headers.Location
-} elseif ($startResp -and $startResp.links -and $startResp.links.self) {
-  $jobLink = $startResp.links.self
-} elseif ($startResp -and $startResp.data -and $startResp.data.id) {
-  $jobLink = "$scopePath/jobs/export/$($startResp.data.id)?version=$Version"
+
+# 1) Body: data.links.self  (use quoted member to avoid edge cases)
+try {
+  if ($startResp -and $startResp.data -and $startResp.data.links) {
+    $tmp = $startResp.data.links.'self'
+    if ($tmp) { $jobLink = $tmp }
+  }
+} catch {}
+
+# 2) Body: links.self (alternate tenants)
+if (-not $jobLink) {
+  try {
+    if ($startResp -and $startResp.links) {
+      $tmp = $startResp.links.'self'
+      if ($tmp) { $jobLink = $tmp }
+    }
+  } catch {}
 }
 
-if (-not $jobLink) { throw "Unexpected export start response; couldn't find job link. Body:`n$($startRaw.Content)" }
+# 3) Location header
+if (-not $jobLink -and $startRaw.Headers -and $startRaw.Headers.Location) {
+  $jobLink = $startRaw.Headers.Location
+}
 
-$jobLink = Resolve-AbsoluteUrl -Base $BaseUrl -MaybeRelative $jobLink
+# 4) Rebuild from id as last resort (NOTE: no /rest here; we’ll normalize below)
+if (-not $jobLink -and $startResp -and $startResp.data -and $startResp.data.id) {
+  $jobLink = "/$($scopePath.TrimStart('/'))/jobs/export/$($startResp.data.id)?version=$Version"
+}
 
-# Align API version to what the server returned in the link, if present
+if (-not $jobLink) {
+  throw "Unexpected export start response; couldn't find job link. Body:`n$($startRaw.Content)"
+}
+
+
+
+$jobLink = Resolve-AbsoluteUrl -Base $BaseUrl -Rel $jobLink
 $verFromLink = Extract-QueryVersion -Url $jobLink
 if ($verFromLink) { $Version = $verFromLink }
 
-# Export ID (for nicer logs; not strictly required)
+
 $exportId = Extract-ExportId -Url $jobLink
 if (-not $exportId) { $exportId = "(unknown)" }
 
@@ -135,6 +157,7 @@ $resultsUri = $jobLink -replace '/jobs/export/', '/export/'
 
 Write-Host "Job: $exportId (version $Version)" -ForegroundColor DarkCyan
 Write-Host "Polling: $statusUri"
+
 
 # --- Poll status (instrumented) ---
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
