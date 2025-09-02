@@ -1,38 +1,33 @@
-<#  Snyk Export: start job, poll, and download CSVs (PS 5.1+)
-    - Works for org or group scope
-    - Builds canonical /rest URLs using data.id
-    - Handles empty/non-JSON poll bodies, 401/404, region mistakes
+<# Snyk Export (PS 5.1-safe)
+   - Start export, poll status, download CSVs
+   - Works at org or group scope
+   - Builds canonical /rest URLs using data.id
 #>
 
 [CmdletBinding(DefaultParameterSetName='Org')]
 param(
   [Parameter(Mandatory=$true, ParameterSetName='Org')]
   [string]$OrgId,
-
   [Parameter(Mandatory=$true, ParameterSetName='Group')]
   [string]$GroupId,
 
-  # Auth & endpoint
   [string]$Token   = $env:SNYK_TOKEN,
-  [string]$BaseUrl = "https://api.snyk.io",     # us-01 default; use https://api.us.snyk.io (us-02) or https://api.eu.snyk.io (EU)
-  [string]$Version = "2025-08-01",              # keep whatever your tenant returns in links/self; this default is safe as of now
+  [string]$BaseUrl = "https://api.snyk.io",     # change to https://api.us.snyk.io or https://api.eu.snyk.io if applicable
+  [string]$Version = "2025-08-01",
 
-  # Export request
   [ValidateSet('issues','usage')]
   [string]$Dataset = "issues",
   [datetime]$UpdatedFrom = (Get-Date).AddDays(-7),
   [datetime]$UpdatedTo   = (Get-Date),
 
-  # Runtime
   [int]$PollSeconds = 10,
   [int]$TimeoutMinutes = 60,
-  [string]$OutDir = ".\snyk-export",
-  [switch]$CombineCsv  # optional: merges all CSVs into one file
+  [string]$OutDir = ".\snyk-export"
 )
 
 if (-not $Token) { throw "Provide -Token or set `$env:SNYK_TOKEN." }
 
-# ---------- Helpers ----------
+# ---------- helpers ----------
 function New-JsonTime([datetime]$dt) { $dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
 
 function Test-SnykScopeAccess {
@@ -41,35 +36,36 @@ function Test-SnykScopeAccess {
   catch { throw "Token cannot read $Url. Fix region ($BaseUrl) or grant 'View reports' on this scope." }
 }
 
-function Get-StatusFromBody([string]$body) {
-  if ([string]::IsNullOrWhiteSpace($body)) { return @{ kind='EMPTY' } }
-  try { $j = $body | ConvertFrom-Json -Depth 32 } catch { return @{ kind='NONJSON'; body=$body } }
-  if ($j.errors) { return @{ kind='ERROR'; code=$j.errors[0].status; details=$j.errors[0].details; raw=$body } }
+function Parse-Status([string]$body) {
+  if ([string]::IsNullOrWhiteSpace($body)) { return @{Kind='EMPTY'} }
+  $j = $null
+  try { $j = $body | ConvertFrom-Json } catch { return @{Kind='NONJSON'} }
+  if ($j -and $j.errors) { return @{Kind='ERROR'; Code=$j.errors[0].status; Details=$j.errors[0].details} }
   $st = $null
   if ($j.data -and $j.data.attributes -and $j.data.attributes.status) { $st = $j.data.attributes.status }
   elseif ($j.attributes -and $j.attributes.status) { $st = $j.attributes.status }
   elseif ($j.status) { $st = $j.status }
-  return @{ kind='OK'; status=$st; json=$j }
+  return @{Kind='OK'; Status=$st; Json=$j}
 }
 
 function Ensure-Dir([string]$p) { if (-not (Test-Path -LiteralPath $p)) { $null = New-Item -ItemType Directory -Path $p -Force } }
 
-# ---------- Build scope & headers ----------
+# ---------- scope & headers ----------
 $scopeNoRest = if ($PSCmdlet.ParameterSetName -eq 'Org') { "/orgs/$OrgId" } else { "/groups/$GroupId" }
 $restScope   = "/rest$($scopeNoRest)"
 
 $headers = @{
-  Authorization   = "token $Token"
-  Accept          = "application/vnd.api+json"
-  "Accept-Encoding" = "identity"     # avoid gzip quirks in PS 5.1
+  Authorization     = "token $Token"
+  Accept            = "application/vnd.api+json"
+  "Accept-Encoding" = "identity"   # avoid gzip weirdness in PS 5.1
   "Cache-Control"   = "no-cache"
 }
 
-# ---------- Fail fast: token + scope ----------
-Test-SnykScopeAccess -Url "$BaseUrl/rest/user/me?version=$Version"  -Headers $headers
-Test-SnykScopeAccess -Url "$BaseUrl$restScope?version=$Version"     -Headers $headers
+# ---------- fail fast on region/permission ----------
+Test-SnykScopeAccess -Url "$BaseUrl/rest/user/me?version=$Version" -Headers $headers
+Test-SnykScopeAccess -Url "$BaseUrl$restScope?version=$Version"    -Headers $headers
 
-# ---------- Start export ----------
+# ---------- start export ----------
 $uFrom = New-JsonTime $UpdatedFrom
 $uTo   = New-JsonTime $UpdatedTo
 
@@ -79,7 +75,7 @@ $body = @{
     attributes = @{
       dataset = $Dataset
       formats = @("csv")
-      filters = @{ updated = @{ from=$uFrom; to=$uTo } }
+      filters = @{ updated = @{ from = $uFrom; to = $uTo } }
     }
   }
 } | ConvertTo-Json -Depth 20
@@ -93,19 +89,23 @@ try {
 } catch { throw "Export start failed: $($_.Exception.Message)" }
 
 if (-not $startResp.Content) { throw "Start export returned empty body." }
-$startJson = $startResp.Content | ConvertFrom-Json -Depth 32
+
+# PS 5.1: ConvertFrom-Json has no -Depth — do NOT pass one
+$startJson = $startResp.Content | ConvertFrom-Json
 $exportId  = $startJson.data.id
 if (-not $exportId) { throw "Could not read data.id from start response:`n$($startResp.Content)" }
 
-# Canonical URLs (ignore any link the API returns)
+# canonical URLs (ignore any link; use id)
 $statusUri  = "$BaseUrl$restScope/jobs/export/$exportId?version=$Version"
 $resultsUri = "$BaseUrl$restScope/export/$exportId?version=$Version"
+
 Write-Host "Job ID: $exportId" -ForegroundColor DarkCyan
 Write-Host "Polling: $statusUri"
 
-# ---------- Poll ----------
+# ---------- poll ----------
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $status = $null
+
 do {
   Start-Sleep -Seconds $PollSeconds
 
@@ -114,21 +114,20 @@ do {
   } catch {
     $m = $_.Exception.Message
     if ($m -match '401') { throw "401 Unauthorized polling status. Token needs 'View reports' on this scope." }
-    if ($m -match '404') { throw "404 Not Found polling status. Check region ($BaseUrl) and exact OrgId/GroupId." }
+    if ($m -match '404') { throw "404 Not Found polling status. Check region ($BaseUrl) and OrgId/GroupId." }
     throw "Status check failed: $m"
   }
 
-  $parsed = Get-StatusFromBody ([string]$poll.Content)
-  switch ($parsed.kind) {
-    'ERROR'   { throw "Snyk API error during poll: $($parsed.code) $($parsed.details)" }
+  $parsed = Parse-Status ([string]$poll.Content)
+  switch ($parsed.Kind) {
+    'ERROR'   { throw "Snyk API error during poll: $($parsed.Code) $($parsed.Details)" }
     'EMPTY'   { $status = 'IN_PROGRESS' }
     'NONJSON' { $status = 'IN_PROGRESS' }
     'OK'      {
-      $status = $parsed.status
-      if (-not $status) { $status = 'IN_PROGRESS' }
+      $status = $parsed.Status; if (-not $status) { $status = 'IN_PROGRESS' }
       Write-Host ("Status: {0} (HTTP {1})" -f $status, $poll.StatusCode)
       if ($status -in @('FAILED','ERROR','CANCELLED')) {
-        $err = $parsed.json.data.attributes.errors
+        $err = $parsed.Json.data.attributes.errors
         throw ("Export job reported $status. " + ($err | ConvertTo-Json -Depth 20))
       }
     }
@@ -137,7 +136,7 @@ do {
 
 if ($status -ne 'FINISHED') { throw "Timed out after $TimeoutMinutes minutes waiting for job $exportId." }
 
-# ---------- Get results ----------
+# ---------- results ----------
 try {
   $res = Invoke-RestMethod -Method GET -Uri $resultsUri -Headers $headers -ErrorAction Stop
 } catch {
@@ -150,7 +149,7 @@ try {
 $items = $res.data.attributes.results
 if (-not $items -or $items.Count -eq 0) { Write-Warning "Finished, but results list was empty."; return }
 
-# ---------- Download files ----------
+# ---------- download ----------
 Ensure-Dir $OutDir
 $files = @()
 foreach ($it in $items) {
@@ -159,23 +158,4 @@ foreach ($it in $items) {
   if (-not $url) { Write-Warning "Unknown result shape:`n$($it | ConvertTo-Json -Depth 20)"; continue }
 
   $name = $it.file_name
-  if (-not $name) { try { $name = ([Uri]$url).Segments[-1] } catch { $name = "export-$exportId-$(Get-Random).csv" } }
-
-  $target = Join-Path $OutDir $name
-  Write-Host "Downloading $name ..."
-  Invoke-WebRequest -Uri $url -OutFile $target -UseBasicParsing -ErrorAction Stop
-  $files += $target
-}
-
-Write-Host "`nDownloaded:" -ForegroundColor Green
-$files | ForEach-Object { Write-Host " - $_" }
-
-# Optional: merge into a single CSV
-if ($CombineCsv -and $files.Count -gt 0) {
-  $combined = Join-Path $OutDir "snyk_export_combined.csv"
-  $rows = foreach ($f in $files) { Import-Csv -LiteralPath $f }
-  $rows | Export-Csv -LiteralPath $combined -NoTypeInformation
-  Write-Host "Combined CSV: $combined" -ForegroundColor Green
-}
-
-Write-Host "`nDone." -ForegroundColor Green
+  if (-not $name) { try { $name = ([Uri]$url).Segments[-1] }
