@@ -1,61 +1,11 @@
-<# 
-.SYNOPSIS
-  Run Snyk Export API and download CSV files (Windows PowerShell 5.1 compatible).
-
-.PARAMETER Token
-  Snyk API token (Personal API token or OAuth access token). Uses header: Authorization: token <Token>.
-
-.PARAMETER OrgId
-  Snyk Organization ID (GUID). Required unless -GroupId is used.
-
-.PARAMETER GroupId
-  Snyk Group ID (GUID). Use this instead of -OrgId for group-level export.
-
-.PARAMETER Dataset
-  Export dataset. Default: 'issues'. (See Snyk Export API docs for valid datasets/columns.)
-
-.PARAMETER Columns
-  Array of column names to include. If omitted, a sensible default set is used.
-
-.PARAMETER Filters
-  Hashtable for API 'filters' (e.g., @{ severity=@('high','critical'); introduced=@{ from='2024-01-01T00:00:00Z'; to='2024-12-31T23:59:59Z' } } )
-
-.PARAMETER IncludeDeleted
-  Switch to include deleted issues.
-
-.PARAMETER IncludeDeactivated
-  Switch to include deactivated/disabled issues.
-
-.PARAMETER ApiBaseUrl
-  Snyk API base. Default: https://api.snyk.io  (Change to your region if needed.)
-
-.PARAMETER ApiVersion
-  REST API version query param (date string). Default: 2024-10-15.
-
-.PARAMETER OutDir
-  Output directory. Defaults to .\SnykExport_<timestamp>
-
-.PARAMETER PollSeconds
-  Seconds between status polls. Default: 6.
-
-.PARAMETER TimeoutMinutes
-  Maximum minutes to wait for export completion. Default: 30.
-
-.EXAMPLE
-  .\Get-SnykExportCsv.ps1 -Token $env:SNYK_TOKEN -OrgId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-
-.EXAMPLE
-  .\Get-SnykExportCsv.ps1 -Token $env:SNYK_TOKEN -OrgId '...' -Dataset issues -Filters @{ severity=@('high','critical') }
-
-.EXAMPLE
-  Group-level:
-  .\Get-SnykExportCsv.ps1 -Token $env:SNYK_TOKEN -GroupId 'gggggggg-....' -Dataset issues
+<# Get-SnykExportCsv.ps1  (Windows PowerShell 5.1)
+    Starts a Snyk Export job, polls to completion, and downloads CSVs.
 #>
 
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)]
-  [string]$Token,
+  [string]$Token,                               # personal token: "token <value>" ; OAuth: use -AuthType Bearer
 
   [Parameter(ParameterSetName='Org', Mandatory=$true)]
   [string]$OrgId,
@@ -63,8 +13,7 @@ param(
   [Parameter(ParameterSetName='Group', Mandatory=$true)]
   [string]$GroupId,
 
-  [string]$Dataset = 'issues',
-
+  [ValidateSet('Issues','issues')] [string]$Dataset = 'issues',
   [string[]]$Columns,
 
   [hashtable]$Filters,
@@ -72,57 +21,110 @@ param(
   [switch]$IncludeDeleted,
   [switch]$IncludeDeactivated,
 
+  [ValidateSet('Token','Bearer')] [string]$AuthType = 'Token',
   [string]$ApiBaseUrl = 'https://api.snyk.io',
   [string]$ApiVersion = '2024-10-15',
 
   [string]$OutDir,
 
   [int]$PollSeconds = 6,
-  [int]$TimeoutMinutes = 30
+  [int]$TimeoutMinutes = 30,
+
+  # date-window helpers to satisfy Snyk’s required date filter
+  [int]$DateWindowDays = 30,    # default: last 30 days
+  [switch]$UseUpdated,          # use updated window instead of introduced
+  [switch]$AllTime              # override: export everything since 1970
 )
 
-# --- Hardening / compatibility for PS 5.1 ---
+# ----- PS 5.1 compat / hardening -----
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [void][Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem')
 
+function Get-IsoUtc([datetime]$dt) { $dt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+
 function New-SnykHeaders {
-  param([string]$Token)
+  param([string]$Token,[string]$AuthType)
+  $auth = if ($AuthType -eq 'Bearer') { "bearer $Token" } else { "token $Token" }
   return @{
-    'Authorization' = "token $Token"   # If you're using OAuth2 access_token, switch to: "bearer $Token"
+    'Authorization' = $auth
     'Accept'        = 'application/vnd.api+json'
     'Content-Type'  = 'application/vnd.api+json'
   }
 }
 
-function Invoke-SnykApi {
-  param(
-    [ValidateSet('GET','POST')]
-    [string]$Method,
-    [string]$Url,
-    [hashtable]$Headers,
-    $BodyJson
-  )
-  Write-Verbose "HTTP $Method $Url"
-  if ($Method -eq 'POST') {
-    return Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers -Body $BodyJson
-  } else {
-    return Invoke-RestMethod -Method Get  -Uri $Url -Headers $Headers
+function Invoke-SnykGet {
+  param([string]$Url,[hashtable]$Headers)
+  Write-Verbose "GET $Url"
+  Invoke-RestMethod -Method Get -Uri $Url -Headers $Headers
+}
+
+function Invoke-SnykPost {
+  param([string]$Url,[hashtable]$Headers,[string]$BodyJson)
+  Write-Verbose "POST $Url"
+  # Use Invoke-WebRequest to capture headers (Location, etc.)
+  $resp = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Url -Headers $Headers -Body $BodyJson
+  $obj = $null
+  if ($resp.Content -and $resp.Content.Trim().Length -gt 0) {
+    try { $obj = $resp.Content | ConvertFrom-Json } catch { }
   }
+  return @{ Json=$obj; Headers=$resp.Headers }
 }
 
 function Get-ExportBasePath {
-  if ($PSCmdlet.ParameterSetName -eq 'Group') {
-    return "/rest/groups/$GroupId"
-  } else {
-    return "/rest/orgs/$OrgId"
-  }
+  if ($PSCmdlet.ParameterSetName -eq 'Group') { "/rest/groups/$GroupId" } else { "/rest/orgs/$OrgId" }
 }
 
-# --- Build request body ---
+function Parse-IdFromUrl([string]$u) {
+  if (-not $u) { return $null }
+  try {
+    $p = (New-Object System.Uri($u)).AbsolutePath.TrimEnd('/')
+  } catch { $p = $u }
+  $last = $p.Split('/')[-1]
+  if ($last -match '^[\w\-]{6,}$') { return $last } else { return $null }
+}
+
+function Find-ExportId {
+  param($PostObj, $Headers)
+  # 1) links.self (top-level or under data)
+  $candidates = @()
+  if ($PostObj) {
+    if ($PostObj.links -and $PostObj.links.self) { $candidates += $PostObj.links.self }
+    if ($PostObj.data) {
+      if ($PostObj.data.links -and $PostObj.data.links.self) { $candidates += $PostObj.data.links.self }
+      if ($PostObj.data.id) { $candidates += $PostObj.data.id }
+      if ($PostObj.id)      { $candidates += $PostObj.id }
+    }
+    if ($PostObj.id) { $candidates += $PostObj.id }
+  }
+  # 2) Location header
+  if ($Headers -and $Headers.Location) { $candidates += $Headers.Location }
+  foreach ($c in $candidates) {
+    $id = Parse-IdFromUrl $c
+    if ($id) { return $id }
+    if ($c -is [string] -and $c -match '^[\w\-]{6,}$') { return $c }
+  }
+  return $null
+}
+
+function Ensure-DateFilter {
+  param([hashtable]$Filters,[switch]$UseUpdated,[switch]$AllTime,[int]$DateWindowDays)
+  if (-not $Filters) { $Filters = @{} }
+  if ($Filters.ContainsKey('introduced') -or $Filters.ContainsKey('updated')) { return $Filters }
+
+  if ($AllTime) {
+    $Filters['introduced'] = @{ from='1970-01-01T00:00:00Z'; to= Get-IsoUtc (Get-Date) }
+  } elseif ($UseUpdated) {
+    $Filters['updated'] = @{ from= Get-IsoUtc ((Get-Date).AddDays(-$DateWindowDays)); to= Get-IsoUtc (Get-Date) }
+  } else {
+    $Filters['introduced'] = @{ from= Get-IsoUtc ((Get-Date).AddDays(-$DateWindowDays)); to= Get-IsoUtc (Get-Date) }
+  }
+  return $Filters
+}
+
+# ----- build request body -----
 if (-not $Columns -or $Columns.Count -eq 0) {
-  # Conservative, broadly useful default column set for 'issues' dataset
   $Columns = @(
     'ISSUE_SEVERITY_RANK','ISSUE_SEVERITY','SCORE',
     'PROBLEM_TITLE','CVE','CWE',
@@ -132,80 +134,111 @@ if (-not $Columns -or $Columns.Count -eq 0) {
   )
 }
 
+$Filters = Ensure-DateFilter -Filters $Filters -UseUpdated:$UseUpdated -AllTime:$AllTime -DateWindowDays $DateWindowDays
+
 $attributes = @{
-  dataset = $Dataset
+  dataset = $Dataset.ToLower()
   columns = $Columns
   formats = @('csv')
-}
-if ($Filters) { $attributes.filters = $Filters }
-
-$body = @{
-  data = @{
-    type       = 'resource'
-    attributes = $attributes
-  }
+  filters = $Filters
 }
 
-$headers = New-SnykHeaders -Token $Token
-$base    = $ApiBaseUrl.TrimEnd('/')
+$body = @{ data = @{ type='resource'; attributes=$attributes } }
+$bodyJson = ($body | ConvertTo-Json -Depth 8)
 
-# --- Start export ---
+# ----- fire export -----
+$base = $ApiBaseUrl.TrimEnd('/')
+$root = Get-ExportBasePath
 $includeParams = @()
 if ($IncludeDeleted)     { $includeParams += 'include_deleted=true' }
 if ($IncludeDeactivated) { $includeParams += 'include_deactivated=true' }
+$qs = @("version=$ApiVersion")
+if ($includeParams.Count) { $qs += $includeParams }
+$exportStartUrl = "{0}{1}/export?{2}" -f $base, $root, ($qs -join '&')
 
-$exportStartUrl = "{0}{1}/export?version={2}{3}" -f `
-  $base, (Get-ExportBasePath), $ApiVersion, ($(if ($includeParams.Count) { '&' + ($includeParams -join '&') } else { '' }))
+$headers = New-SnykHeaders -Token $Token -AuthType $AuthType
+$start = Invoke-SnykPost -Url $exportStartUrl -Headers $headers -BodyJson $bodyJson
 
-$bodyJson = ($body | ConvertTo-Json -Depth 8)
-$startRes = Invoke-SnykApi -Method POST -Url $exportStartUrl -Headers $headers -BodyJson $bodyJson
-
-# Extract export/job id from links.self path (…/export/jobs/{id} or …/export/{id})
-if (-not $startRes.links.self) { throw "Unexpected response: missing links.self" }
-$exportId = ($startRes.links.self -split '/')[-1]
-if (-not $exportId -or $exportId -match '^\s*$') { throw "Failed to parse export id from links.self: $($startRes.links.self)" }
-
+$exportId = Find-ExportId -PostObj $start.Json -Headers $start.Headers
+if (-not $exportId) {
+  Write-Verbose ("POST JSON: " + ($start.Json | ConvertTo-Json -Depth 10))
+  Write-Verbose ("Headers: " + ($start.Headers | Out-String))
+  throw "Could not determine export id from response (no links.self, data.id, or Location header)."
+}
 Write-Host ("Started export id: {0}" -f $exportId)
 
-# --- Poll job status ---
+# ----- poll status (try known patterns) -----
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-$statusUrl = "{0}{1}/jobs/export/{2}?version={3}" -f $base, (Get-ExportBasePath), $exportId, $ApiVersion
+
+function Try-GetStatus {
+  param([string]$Id)
+  $candidates = @(
+    "{0}{1}/jobs/export/{2}?version={3}" -f $base,$root,$Id,$ApiVersion,
+    "{0}{1}/export/jobs/{2}?version={3}" -f $base,$root,$Id,$ApiVersion,
+    "{0}{1}/export/{2}?version={3}"      -f $base,$root,$Id,$ApiVersion,
+    "{0}{1}/exports/{2}?version={3}"     -f $base,$root,$Id,$ApiVersion
+  )
+  foreach ($u in $candidates) {
+    try {
+      $r = Invoke-SnykGet -Url $u -Headers $headers
+      # try several shapes for status
+      $s = $null
+      if ($r.data -and $r.data.attributes -and $r.data.attributes.status) { $s = $r.data.attributes.status }
+      elseif ($r.attributes -and $r.attributes.status) { $s = $r.attributes.status }
+      elseif ($r.status) { $s = $r.status }
+      if ($s) { return @{ Status=$s; Raw=$r; Url=$u } }
+    } catch {
+      continue
+    }
+  }
+  return $null
+}
 
 do {
   Start-Sleep -Seconds $PollSeconds
-  $statusRes = Invoke-SnykApi -Method GET -Url $statusUrl -Headers $headers
-  $status    = $statusRes.data.attributes.status
+  $st = Try-GetStatus -Id $exportId
+  if (-not $st) { Write-Verbose "Status probe failed; retrying..."; continue }
+  $status = $st.Status
   Write-Host ("Status: {0} @ {1:HH:mm:ss}" -f $status, (Get-Date))
-  if ($status -match 'FAILED|ERROR') {
-    throw "Export failed. Status: $status"
-  }
+  if ($status -match 'FAILED|ERROR') { throw "Export failed. Status: $status" }
 } while ($status -notmatch 'COMPLETE|COMPLETED' -and (Get-Date) -lt $deadline)
 
-if ($status -notmatch 'COMPLETE|COMPLETED') {
-  throw "Timeout after $TimeoutMinutes minutes waiting for export to complete."
+if ($status -notmatch 'COMPLETE|COMPLETED') { throw "Timeout after $TimeoutMinutes minutes waiting for export to complete." }
+
+# ----- get results (try several shapes) -----
+function Try-GetResults {
+  param([string]$Id)
+  $urls = @(
+    "{0}{1}/export/{2}?version={3}"        -f $base,$root,$Id,$ApiVersion,
+    "{0}{1}/export/jobs/{2}?version={3}"   -f $base,$root,$Id,$ApiVersion,
+    "{0}{1}/exports/{2}?version={3}"       -f $base,$root,$Id,$ApiVersion,
+    "{0}{1}/export/{2}/results?version={3}"-f $base,$root,$Id,$ApiVersion
+  )
+  foreach ($u in $urls) {
+    try {
+      $r = Invoke-SnykGet -Url $u -Headers $headers
+      $results = $null
+      if ($r.data -and $r.data.attributes -and $r.data.attributes.results) { $results = $r.data.attributes.results }
+      elseif ($r.attributes -and $r.attributes.results) { $results = $r.attributes.results }
+      elseif ($r.results) { $results = $r.results }
+      if ($results) { return $results }
+    } catch { continue }
+  }
+  return $null
 }
 
-# --- Fetch results (download links) ---
-$resultsUrl = "{0}{1}/export/{2}?version={3}" -f $base, (Get-ExportBasePath), $exportId, $ApiVersion
-$resultsRes = Invoke-SnykApi -Method GET -Url $resultsUrl -Headers $headers
+$results = Try-GetResults -Id $exportId
+if (-not $results) { throw "API returned no results to download (tried multiple endpoints)." }
 
-$results = $resultsRes.data.attributes.results
-if (-not $results) { throw "API returned no results to download." }
-
-# --- Prepare output directory ---
+# ----- output dir -----
 if (-not $OutDir) {
-  $stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-  $OutDir = Join-Path -Path (Get-Location) -ChildPath ("SnykExport_{0}" -f $stamp)
+  $OutDir = Join-Path -Path (Get-Location) -ChildPath ("SnykExport_{0}" -f (Get-Date -f 'yyyyMMdd_HHmmss'))
 }
 New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
 
-# --- Helper: extract any url/filename fields we might encounter ---
 function Get-ResultUrlAndName {
   param($r)
-  # try several common shapes
-  $url  = $null
-  $name = $null
-
+  $url  = $null; $name = $null
   if ($r.url)       { $url = $r.url }
   elseif ($r.href)  { $url = $r.href }
   elseif ($r.uri)   { $url = $r.uri }
@@ -218,29 +251,22 @@ function Get-ResultUrlAndName {
 
   if (-not $url)  { throw "Result item missing a download URL: $($r | ConvertTo-Json -Depth 5)" }
   if (-not $name) { $name = 'snyk-export.csv' }
-
-  return @{ Url=$url; Name=$name }
+  @{ Url=$url; Name=$name }
 }
 
-# --- Download all files ---
 $downloaded = @()
 foreach ($r in @($results)) {
   $info = Get-ResultUrlAndName -r $r
   $target = Join-Path -Path $OutDir -ChildPath $info.Name
   Write-Host "Downloading $($info.Url) -> $target"
-  # Note: Snyk's presigned links are public for a short time; authorization header typically not needed.
   try {
-    Invoke-WebRequest -Uri $info.Url -OutFile $target
+    Invoke-WebRequest -UseBasicParsing -Uri $info.Url -OutFile $target
   } catch {
-    # fallback if the link requires auth (rare)
-    Invoke-WebRequest -Uri $info.Url -OutFile $target -Headers @{ 'Authorization' = $headers.Authorization }
+    Invoke-WebRequest -UseBasicParsing -Uri $info.Url -OutFile $target -Headers @{ 'Authorization' = $headers.Authorization }
   }
   $downloaded += $target
-
-  # Unzip if needed
   if ($target.ToLower().EndsWith('.zip')) {
     $unzippedDir = Join-Path $OutDir ([IO.Path]::GetFileNameWithoutExtension($target))
-    Write-Host "Unzipping $target -> $unzippedDir"
     if (-not (Test-Path $unzippedDir)) { New-Item -Path $unzippedDir -ItemType Directory | Out-Null }
     [System.IO.Compression.ZipFile]::ExtractToDirectory($target, $unzippedDir, $true)
   }
