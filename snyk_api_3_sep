@@ -1,56 +1,251 @@
+<# 
+.SYNOPSIS
+  Run Snyk Export API and download CSV files (Windows PowerShell 5.1 compatible).
+
+.PARAMETER Token
+  Snyk API token (Personal API token or OAuth access token). Uses header: Authorization: token <Token>.
+
+.PARAMETER OrgId
+  Snyk Organization ID (GUID). Required unless -GroupId is used.
+
+.PARAMETER GroupId
+  Snyk Group ID (GUID). Use this instead of -OrgId for group-level export.
+
+.PARAMETER Dataset
+  Export dataset. Default: 'issues'. (See Snyk Export API docs for valid datasets/columns.)
+
+.PARAMETER Columns
+  Array of column names to include. If omitted, a sensible default set is used.
+
+.PARAMETER Filters
+  Hashtable for API 'filters' (e.g., @{ severity=@('high','critical'); introduced=@{ from='2024-01-01T00:00:00Z'; to='2024-12-31T23:59:59Z' } } )
+
+.PARAMETER IncludeDeleted
+  Switch to include deleted issues.
+
+.PARAMETER IncludeDeactivated
+  Switch to include deactivated/disabled issues.
+
+.PARAMETER ApiBaseUrl
+  Snyk API base. Default: https://api.snyk.io  (Change to your region if needed.)
+
+.PARAMETER ApiVersion
+  REST API version query param (date string). Default: 2024-10-15.
+
+.PARAMETER OutDir
+  Output directory. Defaults to .\SnykExport_<timestamp>
+
+.PARAMETER PollSeconds
+  Seconds between status polls. Default: 6.
+
+.PARAMETER TimeoutMinutes
+  Maximum minutes to wait for export completion. Default: 30.
+
+.EXAMPLE
+  .\Get-SnykExportCsv.ps1 -Token $env:SNYK_TOKEN -OrgId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+
+.EXAMPLE
+  .\Get-SnykExportCsv.ps1 -Token $env:SNYK_TOKEN -OrgId '...' -Dataset issues -Filters @{ severity=@('high','critical') }
+
+.EXAMPLE
+  Group-level:
+  .\Get-SnykExportCsv.ps1 -Token $env:SNYK_TOKEN -GroupId 'gggggggg-....' -Dataset issues
+#>
+
+[CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$OrgId,             # Your Snyk Org ID
+  [Parameter(Mandatory=$true)]
+  [string]$Token,
 
-    [Parameter(Mandatory=$true)]
-    [string]$ApiToken,          # Snyk API Token
+  [Parameter(ParameterSetName='Org', Mandatory=$true)]
+  [string]$OrgId,
 
-    [Parameter(Mandatory=$true)]
-    [string]$OutDir             # Output folder for CSV files
+  [Parameter(ParameterSetName='Group', Mandatory=$true)]
+  [string]$GroupId,
+
+  [string]$Dataset = 'issues',
+
+  [string[]]$Columns,
+
+  [hashtable]$Filters,
+
+  [switch]$IncludeDeleted,
+  [switch]$IncludeDeactivated,
+
+  [string]$ApiBaseUrl = 'https://api.snyk.io',
+  [string]$ApiVersion = '2024-10-15',
+
+  [string]$OutDir,
+
+  [int]$PollSeconds = 6,
+  [int]$TimeoutMinutes = 30
 )
 
-# Ensure output directory exists
-if (-not (Test-Path $OutDir)) {
-    New-Item -ItemType Directory -Path $OutDir | Out-Null
+# --- Hardening / compatibility for PS 5.1 ---
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[void][Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem')
+
+function New-SnykHeaders {
+  param([string]$Token)
+  return @{
+    'Authorization' = "token $Token"   # If you're using OAuth2 access_token, switch to: "bearer $Token"
+    'Accept'        = 'application/vnd.api+json'
+    'Content-Type'  = 'application/vnd.api+json'
+  }
 }
 
-# Snyk Export API URL
-$baseUrl = "https://api.snyk.io/rest/orgs/$OrgId/export"
-
-# Headers
-$headers = @{
-    "Authorization" = "token $ApiToken"
-    "Content-Type"  = "application/json"
+function Invoke-SnykApi {
+  param(
+    [ValidateSet('GET','POST')]
+    [string]$Method,
+    [string]$Url,
+    [hashtable]$Headers,
+    $BodyJson
+  )
+  Write-Verbose "HTTP $Method $Url"
+  if ($Method -eq 'POST') {
+    return Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers -Body $BodyJson
+  } else {
+    return Invoke-RestMethod -Method Get  -Uri $Url -Headers $Headers
+  }
 }
 
-Write-Host "Starting export for Org: $OrgId" -ForegroundColor Cyan
-
-# Step 1: Create export job
-$jobResponse = Invoke-RestMethod -Method POST -Uri $baseUrl -Headers $headers -Body "{}"
-$jobId = $jobResponse.id
-
-Write-Host "Export job created: $jobId" -ForegroundColor Green
-
-# Step 2: Poll until job is finished
-$jobStatus = "in_progress"
-while ($jobStatus -eq "in_progress") {
-    Start-Sleep -Seconds 10
-    $statusResponse = Invoke-RestMethod -Method GET -Uri "$baseUrl/$jobId" -Headers $headers
-    $jobStatus = $statusResponse.status
-    Write-Host "Job status: $jobStatus" -ForegroundColor Yellow
+function Get-ExportBasePath {
+  if ($PSCmdlet.ParameterSetName -eq 'Group') {
+    return "/rest/groups/$GroupId"
+  } else {
+    return "/rest/orgs/$OrgId"
+  }
 }
 
-if ($jobStatus -ne "complete") {
-    Write-Host "Export failed with status: $jobStatus" -ForegroundColor Red
-    exit 1
+# --- Build request body ---
+if (-not $Columns -or $Columns.Count -eq 0) {
+  # Conservative, broadly useful default column set for 'issues' dataset
+  $Columns = @(
+    'ISSUE_SEVERITY_RANK','ISSUE_SEVERITY','SCORE',
+    'PROBLEM_TITLE','CVE','CWE',
+    'PROJECT_NAME','PROJECT_URL',
+    'EXPLOIT_MATURITY','AUTOFIXABLE',
+    'FIRST_INTRODUCED','ISSUE_URL','ISSUE_STATUS_INDICATOR','ISSUE_TYPE'
+  )
 }
 
-# Step 3: Download CSV files
-foreach ($file in $statusResponse.data.files) {
-    $fileName = Split-Path $file.url -Leaf
-    $outputPath = Join-Path $OutDir $fileName
-    Invoke-WebRequest -Uri $file.url -OutFile $outputPath
-    Write-Host "Downloaded: $outputPath" -ForegroundColor Green
+$attributes = @{
+  dataset = $Dataset
+  columns = $Columns
+  formats = @('csv')
+}
+if ($Filters) { $attributes.filters = $Filters }
+
+$body = @{
+  data = @{
+    type       = 'resource'
+    attributes = $attributes
+  }
 }
 
-Write-Host "✅ Export completed. Files saved to $OutDir" -ForegroundColor Cyan
+$headers = New-SnykHeaders -Token $Token
+$base    = $ApiBaseUrl.TrimEnd('/')
+
+# --- Start export ---
+$includeParams = @()
+if ($IncludeDeleted)     { $includeParams += 'include_deleted=true' }
+if ($IncludeDeactivated) { $includeParams += 'include_deactivated=true' }
+
+$exportStartUrl = "{0}{1}/export?version={2}{3}" -f `
+  $base, (Get-ExportBasePath), $ApiVersion, ($(if ($includeParams.Count) { '&' + ($includeParams -join '&') } else { '' }))
+
+$bodyJson = ($body | ConvertTo-Json -Depth 8)
+$startRes = Invoke-SnykApi -Method POST -Url $exportStartUrl -Headers $headers -BodyJson $bodyJson
+
+# Extract export/job id from links.self path (…/export/jobs/{id} or …/export/{id})
+if (-not $startRes.links.self) { throw "Unexpected response: missing links.self" }
+$exportId = ($startRes.links.self -split '/')[-1]
+if (-not $exportId -or $exportId -match '^\s*$') { throw "Failed to parse export id from links.self: $($startRes.links.self)" }
+
+Write-Host ("Started export id: {0}" -f $exportId)
+
+# --- Poll job status ---
+$deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+$statusUrl = "{0}{1}/jobs/export/{2}?version={3}" -f $base, (Get-ExportBasePath), $exportId, $ApiVersion
+
+do {
+  Start-Sleep -Seconds $PollSeconds
+  $statusRes = Invoke-SnykApi -Method GET -Url $statusUrl -Headers $headers
+  $status    = $statusRes.data.attributes.status
+  Write-Host ("Status: {0} @ {1:HH:mm:ss}" -f $status, (Get-Date))
+  if ($status -match 'FAILED|ERROR') {
+    throw "Export failed. Status: $status"
+  }
+} while ($status -notmatch 'COMPLETE|COMPLETED' -and (Get-Date) -lt $deadline)
+
+if ($status -notmatch 'COMPLETE|COMPLETED') {
+  throw "Timeout after $TimeoutMinutes minutes waiting for export to complete."
+}
+
+# --- Fetch results (download links) ---
+$resultsUrl = "{0}{1}/export/{2}?version={3}" -f $base, (Get-ExportBasePath), $exportId, $ApiVersion
+$resultsRes = Invoke-SnykApi -Method GET -Url $resultsUrl -Headers $headers
+
+$results = $resultsRes.data.attributes.results
+if (-not $results) { throw "API returned no results to download." }
+
+# --- Prepare output directory ---
+if (-not $OutDir) {
+  $stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+  $OutDir = Join-Path -Path (Get-Location) -ChildPath ("SnykExport_{0}" -f $stamp)
+}
+New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
+
+# --- Helper: extract any url/filename fields we might encounter ---
+function Get-ResultUrlAndName {
+  param($r)
+  # try several common shapes
+  $url  = $null
+  $name = $null
+
+  if ($r.url)       { $url = $r.url }
+  elseif ($r.href)  { $url = $r.href }
+  elseif ($r.uri)   { $url = $r.uri }
+  elseif ($r.location) { $url = $r.location }
+  elseif ($r.file -and $r.file.url) { $url = $r.file.url }
+
+  if ($r.filename)      { $name = $r.filename }
+  elseif ($r.file -and $r.file.filename) { $name = $r.file.filename }
+  elseif ($url)         { $name = [IO.Path]::GetFileName( (New-Object System.Uri($url)).AbsolutePath ) }
+
+  if (-not $url)  { throw "Result item missing a download URL: $($r | ConvertTo-Json -Depth 5)" }
+  if (-not $name) { $name = 'snyk-export.csv' }
+
+  return @{ Url=$url; Name=$name }
+}
+
+# --- Download all files ---
+$downloaded = @()
+foreach ($r in @($results)) {
+  $info = Get-ResultUrlAndName -r $r
+  $target = Join-Path -Path $OutDir -ChildPath $info.Name
+  Write-Host "Downloading $($info.Url) -> $target"
+  # Note: Snyk's presigned links are public for a short time; authorization header typically not needed.
+  try {
+    Invoke-WebRequest -Uri $info.Url -OutFile $target
+  } catch {
+    # fallback if the link requires auth (rare)
+    Invoke-WebRequest -Uri $info.Url -OutFile $target -Headers @{ 'Authorization' = $headers.Authorization }
+  }
+  $downloaded += $target
+
+  # Unzip if needed
+  if ($target.ToLower().EndsWith('.zip')) {
+    $unzippedDir = Join-Path $OutDir ([IO.Path]::GetFileNameWithoutExtension($target))
+    Write-Host "Unzipping $target -> $unzippedDir"
+    if (-not (Test-Path $unzippedDir)) { New-Item -Path $unzippedDir -ItemType Directory | Out-Null }
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($target, $unzippedDir, $true)
+  }
+}
+
+Write-Host "`nDone."
+Write-Host ("Output folder: {0}" -f $OutDir)
+Write-Host ("Files downloaded:`n - " + ($downloaded -join "`n - "))
