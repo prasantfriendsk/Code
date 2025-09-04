@@ -1,0 +1,81 @@
+import requests
+import pandas as pd
+import time
+import os
+from dotenv import load_dotenv
+
+# Load credentials from .env file
+load_dotenv()
+INSTANCE = os.getenv("SERVICENOW_INSTANCE")
+API_TOKEN = os.getenv("SERVICENOW_API_TOKEN")
+
+# Set to desired output location
+nas = r'\\mp-netap502-530-cifs2.cntr.thrivnet.corp\fp_cifs_ece_support$\AUTOMATION\temp'
+# Output CSV file path
+CSV_FILE = nas + r"\incidents.csv"
+first_pass = True
+
+# API endpoint
+API_URL = f"{INSTANCE}/api/now/table/incident"
+
+# Paging parameters
+BATCH_SIZE = 5000
+OFFSET = 0
+
+HEADERS = {
+    "Accept": "application/json",
+    "Authorization": f"Bearer {API_TOKEN}"
+}
+
+# Fields to include
+FIELDS = "number,cmdb_ci,priority,opened_at,closed_at"
+
+header_written = False
+
+while True:
+    print(f"Fetching records {OFFSET} to {OFFSET + BATCH_SIZE - 1}...")
+
+    params = {
+        "sysparm_limit": BATCH_SIZE,
+        "sysparm_offset": OFFSET,
+        "sysparm_fields": FIELDS,
+        "sysparm_display_value": "true",
+        "sysparm_query": "active=true"
+    }
+
+    response = requests.get(API_URL, headers=HEADERS, params=params)
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code} - {response.text}")
+        break
+
+    data = response.json().get("result", [])
+
+    if not data:
+        print("No more records to fetch.")
+        break
+
+    cleaned_data = []
+    for record in data:
+        flat_record = {}
+        for field, value in record.items():
+            if isinstance(value, dict) and "display_value" in value:
+                flat_record[field] = value["display_value"]
+            else:
+                flat_record[field] = value
+        cleaned_data.append(flat_record)
+
+    # Convert to DataFrame and append to CSV
+    df = pd.DataFrame(cleaned_data)
+    if first_pass:
+        df.to_csv(CSV_FILE, mode='w', header=True, index=False)  # Overwrite file
+        first_pass = False
+        header_written = True
+    else:
+        df.to_csv(CSV_FILE, mode='a', header=False, index=False)  # Append
+        header_written = True
+
+    print(f"Fetched and saved {len(df)} records.")
+
+    OFFSET += BATCH_SIZE
+    time.sleep(5)  # Wait 5 seconds between requests
