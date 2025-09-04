@@ -1,0 +1,78 @@
+# Load environment variables
+$INSTANCE   = $env:SERVICENOW_INSTANCE
+$API_TOKEN  = $env:SERVICENOW_API_TOKEN
+
+# Output location
+$nas       = "\\mp-netap502-530-cifs2.cntr.thrivnet.corp\fp_cifs_ece_support$\AUTOMATION\temp"
+$CSV_FILE  = Join-Path $nas "incidents.csv"
+
+# API endpoint
+$API_URL   = "$INSTANCE/api/now/table/incident"
+
+# Paging parameters
+$BATCH_SIZE = 5000
+$OFFSET     = 0
+
+# Headers
+$HEADERS = @{
+    "Accept"        = "application/json"
+    "Authorization" = "Bearer $API_TOKEN"
+}
+
+# Fields to include
+$FIELDS = "number,cmdb_ci,priority,opened_at,closed_at"
+
+$FirstPass = $true
+
+while ($true) {
+    Write-Host "Fetching records $OFFSET to $($OFFSET + $BATCH_SIZE - 1)..."
+
+    $params = @{
+        "sysparm_limit"        = $BATCH_SIZE
+        "sysparm_offset"       = $OFFSET
+        "sysparm_fields"       = $FIELDS
+        "sysparm_display_value"= "true"
+        "sysparm_query"        = "active=true"
+    }
+
+    try {
+        $response = Invoke-RestMethod -Method Get -Uri $API_URL -Headers $HEADERS -Body $null -ContentType "application/json" -ErrorAction Stop -Verbose:$false -TimeoutSec 60 -UseBasicParsing -Query $params
+    } catch {
+        Write-Host "Error fetching data: $_"
+        break
+    }
+
+    $data = $response.result
+
+    if (-not $data -or $data.Count -eq 0) {
+        Write-Host "No more records to fetch."
+        break
+    }
+
+    # Flatten display values
+    $cleanedData = @()
+    foreach ($record in $data) {
+        $flatRecord = @{}
+        foreach ($field in $record.PSObject.Properties) {
+            if ($field.Value -is [System.Collections.IDictionary] -and $field.Value.ContainsKey("display_value")) {
+                $flatRecord[$field.Name] = $field.Value.display_value
+            } else {
+                $flatRecord[$field.Name] = $field.Value
+            }
+        }
+        $cleanedData += (New-Object PSObject -Property $flatRecord)
+    }
+
+    # Export to CSV
+    if ($FirstPass) {
+        $cleanedData | Export-Csv -Path $CSV_FILE -NoTypeInformation -Force
+        $FirstPass = $false
+    } else {
+        $cleanedData | Export-Csv -Path $CSV_FILE -NoTypeInformation -Append
+    }
+
+    Write-Host "Fetched and saved $($cleanedData.Count) records."
+
+    $OFFSET += $BATCH_SIZE
+    Start-Sleep -Seconds 5
+}
