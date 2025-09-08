@@ -1,0 +1,170 @@
+# Requires: PowerShell 5.1+
+# Usage example at the bottom.
+
+function Get-SNOWIncidents {
+    [CmdletBinding()]
+    param(
+        # Your instance short name, e.g., "dev12345" (no protocol / path)
+        [Parameter(Mandatory=$true)]
+        [string]$Instance,
+
+        # Either supply -Credential (Basic) OR -BearerToken (OAuth)
+        [Parameter(Mandatory=$false)]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter(Mandatory=$false)]
+        [string]$BearerToken,
+
+        # Columns to return (sysparm_fields)
+        [Parameter(Mandatory=$false)]
+        [string[]]$Fields = @(
+            'sys_id','number','short_description','state','priority',
+            'caller_id','assigned_to','opened_at','closed_at','category'
+        ),
+
+        # ServiceNow sysparm_query string (optional)
+        [Parameter(Mandatory=$false)]
+        [string]$Query = '',
+
+        # Page size (sysparm_limit). Many instances allow up to 10000; 1000 is commonly safe.
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(1,10000)]
+        [int]$PageSize = 1000,
+
+        # Stop after N pages (0 = all pages until exhausted)
+        [Parameter(Mandatory=$false)]
+        [int]$MaxPages = 0,
+
+        # sysparm_display_value: 'false' | 'true' | 'all'
+        [Parameter(Mandatory=$false)]
+        [ValidateSet('false','true','all')]
+        [string]$DisplayValue = 'false',
+
+        # sysparm_exclude_reference_link=true/false
+        [Parameter(Mandatory=$false)]
+        [bool]$ExcludeReferenceLink = $true,
+
+        # Request timeout seconds
+        [Parameter(Mandatory=$false)]
+        [int]$TimeoutSec = 100
+    )
+
+    begin {
+        if (-not $Credential -and [string]::IsNullOrWhiteSpace($BearerToken)) {
+            throw "Provide -Credential for Basic auth or -BearerToken for OAuth."
+        }
+        if ($Credential -and $BearerToken) {
+            throw "Provide only one of -Credential or -BearerToken, not both."
+        }
+
+        # Make sure TLS 1.2 is on for older hosts
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = `
+                [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        } catch {}
+
+        # Build base headers
+        $headers = @{
+            "Accept" = "application/json"
+        }
+
+        if ($Credential) {
+            $pair   = "{0}:{1}" -f $Credential.UserName, $Credential.GetNetworkCredential().Password
+            $auth   = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+            $headers["Authorization"] = "Basic $auth"
+        }
+        elseif ($BearerToken) {
+            $headers["Authorization"] = "Bearer $BearerToken"
+        }
+
+        # Helper to URL-encode querystring values (for PS 5.1)
+        Add-Type -AssemblyName System.Web | Out-Null
+        function _enc([string]$s) {
+            return [System.Web.HttpUtility]::UrlEncode($s)
+        }
+
+        $baseUri = "https://$Instance.service-now.com/api/now/table/incident"
+        $allRows = New-Object System.Collections.Generic.List[object]
+        $offset  = 0
+        $page    = 0
+    }
+
+    process {
+        while ($true) {
+            $qs = @(
+                "sysparm_limit=$PageSize",
+                "sysparm_offset=$offset",
+                "sysparm_fields=$(_enc(($Fields -join ',')))",
+                "sysparm_display_value=$DisplayValue",
+                "sysparm_exclude_reference_link=$(([string]$ExcludeReferenceLink).ToLower())"
+            )
+
+            if ($Query) {
+                # Note: ServiceNow accepts unencoded queries too, but encoding is safer.
+                $qs += "sysparm_query=$(_enc($Query))"
+            }
+
+            $uri = "$baseUri?$(($qs -join '&'))"
+
+            try {
+                $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers -TimeoutSec $TimeoutSec
+            } catch {
+                $status = $_.Exception.Response.StatusCode.Value__
+                $retryAfter = $_.Exception.Response.Headers['Retry-After']
+                if ($status -eq 429 -and $retryAfter) {
+                    Write-Warning "Hit 429 (rate limited). Sleeping $retryAfter seconds then retrying page at offset $offset..."
+                    Start-Sleep -Seconds ([int]$retryAfter)
+                    continue
+                } else {
+                    throw "Request failed (HTTP $status). $($_.Exception.Message)"
+                }
+            }
+
+            if ($null -eq $resp -or $null -eq $resp.result) {
+                break
+            }
+
+            $batch = @($resp.result)
+            if ($batch.Count -eq 0) {
+                break
+            }
+
+            $allRows.AddRange($batch)
+            $offset += $batch.Count
+            $page   += 1
+
+            # Stop if we got a short page or hit the page cap
+            if ($batch.Count -lt $PageSize) { break }
+            if ($MaxPages -gt 0 -and $page -ge $MaxPages) { break }
+        }
+
+        # Emit as objects (so you can pipe to Export-Csv, ConvertTo-Json, etc.)
+        $allRows
+    }
+}
+
+<# --------------------
+   EXAMPLES
+   --------------------
+
+# 1) Basic auth (you'll be prompted for username/password):
+$cred = Get-Credential
+Get-SNOWIncidents -Instance 'dev12345' -Credential $cred `
+  -Fields number,short_description,priority,state,assigned_to,opened_at `
+  -Query 'priority=1^ORpriority=2^state!=7' `
+  -PageSize 500 -DisplayValue 'true' |
+  Export-Csv -NoTypeInformation -Path '.\incidents_p1_p2_open.csv'
+
+# 2) OAuth bearer token:
+Get-SNOWIncidents -Instance 'prod01234' -BearerToken $env:SNOW_TOKEN `
+  -Fields number,sys_id,short_description,state,caller_id,category `
+  -Query 'opened_at>=javascript:gs.beginningOfLast7Days()' `
+  -PageSize 1000 -ExcludeReferenceLink $true |
+  ConvertTo-Json -Depth 5 | Out-File .\incidents_last7d.json -Encoding utf8
+
+# 3) Pull everything (be mindful of instance limits):
+$cred = Get-Credential
+Get-SNOWIncidents -Instance 'dev12345' -Credential $cred -PageSize 1000 -MaxPages 50 |
+  Select-Object number,short_description,state,priority | Out-GridView
+
+#>
