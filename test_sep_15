@@ -1,0 +1,13 @@
+# Pick the first existing directory from this list
+$CandidateDirs = @(
+  $env:OneDrive,
+  "$HOME\Downloads",
+  $HOME,
+  (Get-Location).Path,
+  $env:TEMP
+) | Where-Object { $_ -and (Test-Path $_) }
+
+$OutDir  = $CandidateDirs | Select-Object -First 1
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+$OutFile = Join-Path $OutDir "Vulnerable.csv"
+Write-Host "Writing CSV to: $OutFile"
