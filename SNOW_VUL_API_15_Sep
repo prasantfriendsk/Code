@@ -1,0 +1,105 @@
+# ===================== ServiceNow Table → CSV (single script) =====================
+# Config
+$Instance  = "thrivent"                         # subdomain only (e.g., contoso)
+$Table     = "sn_vul_vulnerable_item"           # change to 'incident' if needed
+$Token     = "REPLACE_WITH_BEARER_TOKEN"
+$OutFile   = "C:\Temp\Vulnerable.csv"
+
+# Fields (dot-walk allowed)
+$Fields = @(
+  "number","state","sys_created_on","sys_updated_on",
+  "assignment_group","assigned_to",
+  "risk_score","risk_rating",
+  "vulnerability","vulnerability.name","vulnerability.summary",
+  "short_description","description",
+  "cmdb_ci","cmdb_ci.sys_class_name",
+  "source","age_duration","age_closed"
+) -join ','
+
+# Query (compose parts so it’s easy to tweak)
+$QueryParts = @()
+$QueryParts += "active=true"
+# example date window — adjust or comment out
+$QueryParts += "sys_created_onBETWEENjavascript:gs.dateGenerate('2020-01-01','00:00:00')@javascript:gs.dateGenerate('2021-01-01','00:00:00')"
+$Query = ($QueryParts -join '^') + "^ORDERBYnumber"
+
+# REST bits
+$BaseUri = "https://$Instance.service-now.com/api/now/table/$Table"
+$Headers = @{
+  "Accept"        = "application/json"
+  "Authorization" = "Bearer $Token"
+}
+
+# Pagination (SNOW default hard cap is 10,000 per call)
+$BatchSize = 10000
+$Offset    = 0
+$FirstPass = $true
+
+do {
+    # Build query string safely (handles URL encoding)
+    $qs = [System.Web.HttpUtility]::ParseQueryString("")
+    $qs["sysparm_limit"]                  = $BatchSize
+    $qs["sysparm_offset"]                 = $Offset
+    $qs["sysparm_fields"]                 = $Fields
+    $qs["sysparm_display_value"]          = "true"
+    $qs["sysparm_exclude_reference_link"] = "true"
+    if ($Query) { $qs["sysparm_query"] = $Query }
+
+    $Uri = "$BaseUri?$($qs.ToString())"
+    Write-Host "Fetching offset $Offset (limit $BatchSize)..."
+
+    # Basic retry for 429/5xx
+    $attempt = 0; $max = 4
+    while ($true) {
+        try {
+            $resp = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ContentType "application/json" -TimeoutSec 300 -ErrorAction Stop
+            break
+        } catch {
+            $attempt++
+            $status = $_.Exception.Response.StatusCode.Value__ 2>$null
+            if ($attempt -lt $max -and ($status -eq 429 -or $status -ge 500)) {
+                $delay = [Math]::Min(60,[Math]::Pow(2,$attempt))
+                Write-Warning "HTTP $status. Retrying in $delay sec... (attempt $attempt/$max)"
+                Start-Sleep -Seconds $delay
+            } else {
+                throw
+            }
+        }
+    }
+
+    $rows = @($resp.result)
+    if ($rows.Count -eq 0) { Write-Host "No more records."; break }
+
+    # Flatten: prefer display_value; arrays -> semicolon list; keep long text intact
+    $clean = foreach ($rec in $rows) {
+        $h = @{}
+        foreach ($p in $rec.PSObject.Properties) {
+            $v = $p.Value
+            if ($v -is [System.Collections.IDictionary] -and $v.Contains("display_value")) {
+                $val = $v.display_value
+            } elseif ($v -is [System.Collections.IEnumerable] -and -not ($v -is [string])) {
+                $val = ($v | ForEach-Object { $_.ToString() }) -join '; '
+            } else {
+                $val = $v
+            }
+            # If you want to strip newlines from long text, uncomment next line:
+            # if ($val -is [string]) { $val = $val -replace "\r?\n"," " }
+            $h[$p.Name] = $val
+        }
+        [pscustomobject]$h
+    }
+
+    if ($FirstPass) {
+        $clean | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8 -Force
+        $FirstPass = $false
+    } else {
+        $clean | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8 -Append
+    }
+
+    Write-Host ("Wrote {0} rows to {1}" -f $clean.Count, $OutFile)
+    $Offset += $BatchSize
+    Start-Sleep -Milliseconds 500
+} while ($true)
+
+Write-Host "Done."
+# ===================== end script =====================
