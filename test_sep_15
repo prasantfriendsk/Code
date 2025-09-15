@@ -1,6 +1,6 @@
 $API_TOKEN = "Test"
 $nas = "C:\Users\z383759\OneDrive - Thrivent\Work\Vulnerability Service Now DS\"
-$CSV_FILE = Join-Path $nas "Vulnerable.csv"
+$JSON_FILE = Join-Path $nas "Vulnerable.json"
 $API_URL = "https://thrivent.service-now.com/api/now/table/sn_vul_vulnerable_item"
 $BATCH_SIZE = 15000
 $OFFSET = 0
@@ -12,21 +12,12 @@ $HEADERS = @{
 
 $Fields = "number,vulnerability,vulnerability.ref_sn_vul_third_party_entry.cves_list,vulnerability.name,risk_score,risk_rating,cmdb_ci,cmdb_ci.sys_class_name,state,sys_created_on,last_found,ttr_target_date,ttr_status,assignment_rule,assignment_group,assigned_to,u_remediation_task_groups,source,assignment_type,assignment_group.manager.x_thfl_sprsrvygor_supervisory_organization.managed_by.manager,vulnerability.epss_score,vulnerability.exploit,age_duration,age_closed,source_risk_score,closed_at,x_wiz_vul_fixable,last_opened,defer_count,ignore_date,ignore_reason,description"
 
-$FirstPass = $true
 $Query = 'sys_created_onBETWEENjavascript:gs.dateGenerate("2020-01-01","00:00:00")@javascript:gs.dateGenerate("2021-01-01","00:00:00")^ORDERBYnumber'
+
+$AllData = @()
 
 function _enc([string]$s) {
     return [System.Web.HttpUtility]::UrlEncode($s)
-}
-
-function Escape-CsvField {
-    param($value)
-    if ($null -eq $value) { return "" }
-    # Replace newlines and carriage returns with spaces
-    $escaped = $value -replace "(`r`n|`r|`n)", " "
-    # Escape double quotes by doubling them
-    $escaped = $escaped -replace '"', '""'
-    return '"' + $escaped + '"'
 }
 
 while ($true) {
@@ -68,7 +59,6 @@ while ($true) {
         break
     }
 
-    $cleanedData = @()
     foreach ($record in $data) {
         $flatRecord = @{}
         foreach ($field in $record.PSObject.Properties) {
@@ -77,35 +67,17 @@ while ($true) {
             } else {
                 $val = $field.Value
             }
-
-            # Sanitize fields like 'description' or others prone to multiline text
-            if ($field.Name -in @("description")) {
-                if ($val) {
-                    $val = $val -replace "(`r`n|`r|`n)", " "
-                    $val = $val -replace '"', '""'
-                }
-            }
-
             $flatRecord[$field.Name] = $val
         }
-        $cleanedData += (New-Object PSObject -Property $flatRecord)
+        $AllData += (New-Object PSObject -Property $flatRecord)
     }
 
-    if ($FirstPass) {
-        # Write header line
-        ($cleanedData[0].PSObject.Properties.Name | ForEach-Object { '"' + $_ + '"' }) -join "," | Out-File -FilePath $CSV_FILE -Encoding utf8
-        $FirstPass = $false
-    }
-
-    # Write each record sanitized
-    foreach ($record in $cleanedData) {
-        $line = $record.PSObject.Properties | ForEach-Object {
-            Escape-CsvField $_.Value
-        } -join ","
-        Add-Content -Path $CSV_FILE -Value $line -Encoding utf8
-    }
-
-    Write-Host "Fetched and saved $($cleanedData.Count) records."
+    Write-Host "Fetched $($data.Count) records."
     $OFFSET += $BATCH_SIZE
     Start-Sleep -Seconds 5
 }
+
+# After all data is fetched, export to JSON
+$AllData | ConvertTo-Json -Depth 10 | Out-File -FilePath $JSON_FILE -Encoding utf8
+
+Write-Host "All records have been saved to $JSON_FILE"
