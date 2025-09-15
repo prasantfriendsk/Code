@@ -1,0 +1,85 @@
+$API_TOKEN = "Test"
+$nas = "C:\Users\z383759\OneDrive - Thrivent\Work\Vulnerability Service Now DS\"
+$CSV_FILE = Join-Path $nas "Vulnerable.csv"
+$API_URL = "https://thrivent.service-now.com/api/now/table/sn_vul_vulnerable_item"
+$BATCH_SIZE = 15000
+$OFFSET = 0
+
+$HEADERS = @{
+    "Accept"        = "application/json"
+    "Authorization" = "Bearer $API_TOKEN"
+}
+
+$Fields = "number,vulnerability,vulnerability.ref_sn_vul_third_party_entry.cves_list,vulnerability.name,risk_score,risk_rating,cmdb_ci,cmdb_ci.sys_class_name,state,sys_created_on,last_found,ttr_target_date,ttr_status,assignment_rule,assignment_group,assigned_to,u_remediation_task_groups,source,assignment_type,assignment_group.manager.x_thfl_sprsrvygor_supervisory_organization.managed_by.manager,vulnerability.epss_score,vulnerability.exploit,age_duration,age_closed,source_risk_score,closed_at,x_wiz_vul_fixable,last_opened,defer_count,ignore_date,ignore_reason"
+#$Fields = 'vulnerability.summary,short_description,description'
+
+$FirstPass = $true
+$Query = 'sys_created_onBETWEENjavascript:gs.dateGenerate("2020-01-01","00:00:00")@javascript:gs.dateGenerate("2021-01-01","00:00:00")^ORDERBYnumber'
+
+function _enc([string]$s) {
+    return [System.Web.HttpUtility]::UrlEncode($s)
+}
+
+while ($true) {
+    Write-Host "Fetching records $OFFSET to $($OFFSET + $BATCH_SIZE - 1)..."
+
+    $params = @{
+        "sysparm_limit"          = $BATCH_SIZE
+        "sysparm_offset"         = $OFFSET
+        "sysparm_fields"         = $Fields
+        "sysparm_display_value"  = "true"
+        "sysparm_query"          = "active=true"
+    }
+
+    $qs = @{
+        "sysparm_limit"         = "$PageSize"
+        "sysparm_offset"        = "$offset"
+        "sysparm_fields"        = "$(_enc($Fields -join ','))"
+        "sysparm_display_value" = "true"
+    }
+
+    if ($Query) {
+        $qs += "sysparm_query=$(_enc($Query))"
+    }
+
+    $API_URL = "https://thrivent.service-now.com/api/now/table/sn_vul_vulnerable_item?$( $qs -join '&')"
+
+    try {
+        $response = Invoke-RestMethod -Method Get -Uri $API_URL -Headers $HEADERS -Body $null -ContentType "application/json" -ErrorAction Stop -Verbose:$false -TimeoutSec 60 -UseBasicParsing
+        Write-Host "Response : $response"
+    } catch {
+        Write-Host "Error fetching data: $_"
+        break
+    }
+
+    $data = $response.result
+
+    if (-not $data -or $data.Count -eq 0) {
+        Write-Host "No more records to fetch."
+        break
+    }
+
+    $cleanedData = @()
+    foreach ($record in $data) {
+        $flatRecord = @{}
+        foreach ($field in $record.PSObject.Properties) {
+            if ($field.Value -is [System.Collections.IDictionary] -and $field.Value.ContainsKey("display_value")) {
+                $flatRecord[$field.Name] = $field.Value.display_value
+            } else {
+                $flatRecord[$field.Name] = $field.Value
+            }
+        }
+        $cleanedData += (New-Object PSObject -Property $flatRecord)
+    }
+
+    if ($FirstPass) {
+        $cleanedData | Export-Csv -Path $CSV_FILE -NoTypeInformation -Force
+        $FirstPass = $false
+    } else {
+        $cleanedData | Export-Csv -Path $CSV_FILE -NoTypeInformation -Append
+    }
+
+    Write-Host "Fetched and saved $($cleanedData.Count) records."
+    $OFFSET += $BATCH_SIZE
+    Start-Sleep -Seconds 5
+}
