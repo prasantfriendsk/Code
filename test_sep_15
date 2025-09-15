@@ -1,25 +1,25 @@
-# Export ServiceNow Vulnerable Items -> CSV (PowerShell 5.1+)
-
-$API_TOKEN = "Test"  # <-- real bearer here
+# Export ServiceNow Vulnerable Items -> CSV (PS 5.1/7)
+$API_TOKEN = "Test"
 $BaseUrl   = "https://thrivent.service-now.com"
 $Table     = "sn_vul_vulnerable_item"
 
-$nas       = "C:\Users\z383759\OneDrive - Thrivent\Work\Vulnerability Service Now DS\"
-$CSV_FILE  = Join-Path $nas "Vulnerable.csv"
+$nas      = "C:\Users\z383759\OneDrive - Thrivent\Work\Vulnerability Service Now DS\"
+$CSV_FILE = Join-Path $nas "Vulnerable.csv"
 
-$BATCH_SIZE = 15000    # if your instance caps, drop to 10000 or 1000
+$BATCH_SIZE = 15000
 $OFFSET     = 0
 $SLEEP_SEC  = 3
 
-# Ensure output folder exists
+# Encoder that works on both PS 5.1 and PS 7
+function Encode([string]$s) { [System.Uri]::EscapeDataString($s) }
+
 $null = New-Item -ItemType Directory -Path $nas -Force -ErrorAction SilentlyContinue
 
 $HEADERS = @{
-  "Accept"        = "application/json"
-  "Authorization" = "Bearer $API_TOKEN"
+  Accept        = "application/json"
+  Authorization = "Bearer $API_TOKEN"
 }
 
-# Dot-walk fields are fine; display values returned as strings
 $Fields = @(
   "number","vulnerability","vulnerability.ref_sn_vul_third_party_entry.cves_list","vulnerability.name",
   "risk_score","risk_rating","cmdb_ci","cmdb_ci.sys_class_name","state","sys_created_on","last_found",
@@ -30,37 +30,36 @@ $Fields = @(
   "closed_at","x_wiz_vul_fixable","last_opened","defer_count","ignore_date","ignore_reason"
 )
 
-# Compose query (merge active=true + date window + ORDERBY)
-$QueryParts = @(
+$Query = @(
   "active=true",
   'sys_created_onBETWEENjavascript:gs.dateGenerate("2020-01-01","00:00:00")@javascript:gs.dateGenerate("2021-01-01","00:00:00")',
   "ORDERBYnumber"
-)
-$Query = ($QueryParts -join '^')
+) -join '^'
 
 $FirstPass = $true
 
 while ($true) {
   Write-Host ("Fetching records {0} to {1}..." -f $OFFSET, ($OFFSET + $BATCH_SIZE - 1))
 
-  # Build query string safely
   $qsMap = @{
     sysparm_limit         = $BATCH_SIZE
     sysparm_offset        = $OFFSET
-    sysparm_fields        = ($Fields -join ',')
+    sysparm_fields        = ($Fields -join ',') # leave commas unencoded for ServiceNow
     sysparm_display_value = "true"
     sysparm_query         = $Query
   }
+
+  # Encode values except the comma-list of fields (ServiceNow parses better without %2C)
   $queryString = ($qsMap.GetEnumerator() | ForEach-Object {
-    '{0}={1}' -f $_.Key, [System.Web.HttpUtility]::UrlEncode([string]$_.Value)
-  } | Sort-Object) -join '&'
+      $val = if ($_.Key -eq 'sysparm_fields') { [string]$_.Value } else { Encode([string]$_.Value) }
+      '{0}={1}' -f $_.Key, $val
+  }) -join '&'
 
   $requestUri = "$BaseUrl/api/now/table/$Table?$queryString"
 
   try {
     $response = Invoke-RestMethod -Method Get -Uri $requestUri -Headers $HEADERS -TimeoutSec 120 -ErrorAction Stop
-  }
-  catch {
+  } catch {
     if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 429) {
       Write-Warning "Rate limited (429). Sleeping 10s then retrying..."
       Start-Sleep -Seconds 10
@@ -71,12 +70,8 @@ while ($true) {
   }
 
   $data = $response.result
-  if (-not $data -or $data.Count -eq 0) {
-    Write-Host "No more records to fetch."
-    break
-  }
+  if (-not $data -or $data.Count -eq 0) { Write-Host "No more records to fetch."; break }
 
-  # Flatten: if the instance ignores sysparm_display_value, grab .display_value; also join arrays
   $cleanedData = foreach ($record in $data) {
     $flat = @{}
     foreach ($p in $record.PSObject.Properties) {
