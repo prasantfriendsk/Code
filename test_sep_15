@@ -1,13 +1,107 @@
-# Pick the first existing directory from this list
-$CandidateDirs = @(
-  $env:OneDrive,
-  "$HOME\Downloads",
-  $HOME,
-  (Get-Location).Path,
-  $env:TEMP
-) | Where-Object { $_ -and (Test-Path $_) }
+# Export ServiceNow Vulnerable Items -> CSV (PowerShell 5.1+)
 
-$OutDir  = $CandidateDirs | Select-Object -First 1
-New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-$OutFile = Join-Path $OutDir "Vulnerable.csv"
-Write-Host "Writing CSV to: $OutFile"
+$API_TOKEN = "Test"  # <-- real bearer here
+$BaseUrl   = "https://thrivent.service-now.com"
+$Table     = "sn_vul_vulnerable_item"
+
+$nas       = "C:\Users\z383759\OneDrive - Thrivent\Work\Vulnerability Service Now DS\"
+$CSV_FILE  = Join-Path $nas "Vulnerable.csv"
+
+$BATCH_SIZE = 15000    # if your instance caps, drop to 10000 or 1000
+$OFFSET     = 0
+$SLEEP_SEC  = 3
+
+# Ensure output folder exists
+$null = New-Item -ItemType Directory -Path $nas -Force -ErrorAction SilentlyContinue
+
+$HEADERS = @{
+  "Accept"        = "application/json"
+  "Authorization" = "Bearer $API_TOKEN"
+}
+
+# Dot-walk fields are fine; display values returned as strings
+$Fields = @(
+  "number","vulnerability","vulnerability.ref_sn_vul_third_party_entry.cves_list","vulnerability.name",
+  "risk_score","risk_rating","cmdb_ci","cmdb_ci.sys_class_name","state","sys_created_on","last_found",
+  "ttr_target_date","ttr_status","assignment_rule","assignment_group","assigned_to","u_remediation_task_groups",
+  "source","assignment_type",
+  "assignment_group.manager.x_thfl_sprsrvygor_supervisory_organization.managed_by.manager",
+  "vulnerability.epss_score","vulnerability.exploit","age_duration","age_closed","source_risk_score",
+  "closed_at","x_wiz_vul_fixable","last_opened","defer_count","ignore_date","ignore_reason"
+)
+
+# Compose query (merge active=true + date window + ORDERBY)
+$QueryParts = @(
+  "active=true",
+  'sys_created_onBETWEENjavascript:gs.dateGenerate("2020-01-01","00:00:00")@javascript:gs.dateGenerate("2021-01-01","00:00:00")',
+  "ORDERBYnumber"
+)
+$Query = ($QueryParts -join '^')
+
+$FirstPass = $true
+
+while ($true) {
+  Write-Host ("Fetching records {0} to {1}..." -f $OFFSET, ($OFFSET + $BATCH_SIZE - 1))
+
+  # Build query string safely
+  $qsMap = @{
+    sysparm_limit         = $BATCH_SIZE
+    sysparm_offset        = $OFFSET
+    sysparm_fields        = ($Fields -join ',')
+    sysparm_display_value = "true"
+    sysparm_query         = $Query
+  }
+  $queryString = ($qsMap.GetEnumerator() | ForEach-Object {
+    '{0}={1}' -f $_.Key, [System.Web.HttpUtility]::UrlEncode([string]$_.Value)
+  } | Sort-Object) -join '&'
+
+  $requestUri = "$BaseUrl/api/now/table/$Table?$queryString"
+
+  try {
+    $response = Invoke-RestMethod -Method Get -Uri $requestUri -Headers $HEADERS -TimeoutSec 120 -ErrorAction Stop
+  }
+  catch {
+    if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 429) {
+      Write-Warning "Rate limited (429). Sleeping 10s then retrying..."
+      Start-Sleep -Seconds 10
+      continue
+    }
+    Write-Error "Error fetching data: $($_.Exception.Message)"
+    break
+  }
+
+  $data = $response.result
+  if (-not $data -or $data.Count -eq 0) {
+    Write-Host "No more records to fetch."
+    break
+  }
+
+  # Flatten: if the instance ignores sysparm_display_value, grab .display_value; also join arrays
+  $cleanedData = foreach ($record in $data) {
+    $flat = @{}
+    foreach ($p in $record.PSObject.Properties) {
+      $v = $p.Value
+      if ($v -is [System.Collections.IDictionary] -and $v.Contains('display_value')) {
+        $flat[$p.Name] = $v.display_value
+      } elseif ($v -is [System.Collections.IEnumerable] -and -not ($v -is [string])) {
+        $flat[$p.Name] = ($v -join '; ')
+      } else {
+        $flat[$p.Name] = $v
+      }
+    }
+    [PSCustomObject]$flat
+  }
+
+  if ($FirstPass) {
+    $cleanedData | Export-Csv -Path $CSV_FILE -NoTypeInformation -Encoding UTF8 -Force
+    $FirstPass = $false
+  } else {
+    $cleanedData | Export-Csv -Path $CSV_FILE -NoTypeInformation -Encoding UTF8 -Append
+  }
+
+  Write-Host ("Fetched and saved {0} records." -f $cleanedData.Count)
+  $OFFSET += $BATCH_SIZE
+  Start-Sleep -Seconds $SLEEP_SEC
+}
+
+Write-Host "Done. Output => $CSV_FILE"
