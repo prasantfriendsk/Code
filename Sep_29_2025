@@ -1,0 +1,198 @@
+<#
+.SYNOPSIS
+    Exports vulnerable item data from a ServiceNow instance to a CSV file.
+.DESCRIPTION
+    This script fetches data from the ServiceNow 'sn_vul_vulnerable_item' table using a paginated REST API call.
+    It prompts for the required API token securely and processes the data in batches, saving the results to a CSV file.
+    The script is designed to handle large datasets by fetching records in manageable chunks.
+    It includes a retry mechanism to handle transient network or API errors.
+.PARAMETER OutputPath
+    The full path to the directory where the output CSV file will be saved.
+    Defaults to the user's "Documents" folder.
+.PARAMETER FileName
+    The name of the output CSV file. Defaults to "Vulnerable_Items.csv".
+.PARAMETER ServiceNowInstance
+    The base URL of your ServiceNow instance (e.g., "thrivent.service-now.com").
+.EXAMPLE
+    .\Export-ServiceNowVulnerabilities.ps1 -ServiceNowInstance "myinstance.service-now.com"
+
+    This command will run the script, prompt for an API token, and save the data to
+    C:\Users\<YourUser>\Documents\Vulnerable_Items.csv using the default query.
+.NOTES
+    Author: Gemini
+    Version: 3.0
+    - Added a retry mechanism for API calls to improve reliability.
+    - Increased the default timeout for API requests.
+    - Added more robust logging and response validation.
+    - Refactored for security (prompts for token).
+    - Simplified API parameter handling.
+    - Uses modern PowerShell practices ([PSCustomObject]).
+    - Added parameters for easier reuse.
+    - Enhanced data sanitization to remove newlines, tabs, and carriage returns.
+    - Added truncation for fields that exceed Excel's character limit.
+#>
+[CmdletBinding()]
+param (
+    [string]$OutputPath = [System.Environment]::GetFolderPath('MyDocuments'),
+    [string]$FileName = "Vulnerable_Items.csv",
+    [string]$ServiceNowInstance = "thrivent.service-now.com"
+)
+
+# --- Configuration ---
+
+# Securely prompt for the API bearer token.
+$ApiToken = Read-Host -Prompt "Please enter your ServiceNow API Bearer Token" -AsSecureString
+
+# Define the full path for the output CSV file.
+$CsvFile = Join-Path -Path $OutputPath -ChildPath $FileName
+
+# API connection settings
+$ApiEndpoint = "https://{0}/api/now/table/sn_vul_vulnerable_item" -f $ServiceNowInstance
+$BatchSize = 5000
+$Offset = 0
+$RequestTimeoutSec = 300 # Increased timeout (in seconds)
+$MaxRetries = 3          # Number of times to retry a failed API request
+$RetryDelaySec = 10      # Delay between retries (in seconds)
+
+
+# Define the fields to be returned by the API call.
+$FieldsToRequest = @(
+    "number",
+    "vulnerability.vulnerability.ref_sn_vul_third_party_entry.cves_list",
+    "vulnerability.name",
+    "risk_score",
+    "risk_rating",
+    "cmdb_ci",
+    "cmdb_ci.sys_class_name",
+    "state",
+    "sys_created_on",
+    "last_found",
+    "ttr_target_date",
+    "vulnerability.summary",
+    "short_description",
+    "description"
+) -join ','
+
+# Define the ServiceNow query. Modify this query as needed.
+# This example fetches records created between Jan 1, 2020, and Jan 1, 2021.
+$Query = 'sys_created_onBETWEENjavascript:gs.dateGenerate("2020-01-01","00:00:00")@javascript:gs.dateGenerate("2021-01-01","00:00:00")^ORDERBYnumber'
+
+# --- Main Script ---
+
+# Convert the secure string token to plain text for the header.
+$BypassTokenPolicy = New-Object System.Management.Automation.PSCredential ("user", $ApiToken)
+$PlainTextToken = $BypassTokenPolicy.GetNetworkCredential().Password
+
+$Headers = @{
+    "Accept"        = "application/json"
+    "Authorization" = "Bearer $PlainTextToken"
+}
+
+$isFirstBatch = $true
+
+# Loop to fetch data in batches until no more records are returned.
+while ($true) {
+    Write-Host "Fetching records from offset $Offset..."
+
+    $queryParams = @{
+        "sysparm_limit"         = $BatchSize
+        "sysparm_offset"        = $Offset
+        "sysparm_fields"        = $FieldsToRequest
+        "sysparm_display_value" = "true"
+        "sysparm_query"         = $Query
+    }
+
+    $response = $null
+    $requestSuccess = $false
+
+    # --- Retry Loop ---
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $response = Invoke-RestMethod -Method Get -Uri $ApiEndpoint -Headers $Headers -Body $queryParams -ContentType "application/json" -ErrorAction Stop -TimeoutSec $RequestTimeoutSec
+            $requestSuccess = $true
+            break # Exit retry loop on success
+        }
+        catch {
+            Write-Warning "Attempt $attempt of $MaxRetries failed. Error: $_"
+            if ($attempt -lt $MaxRetries) {
+                Write-Host "Waiting for $RetryDelaySec seconds before retrying..."
+                Start-Sleep -Seconds $RetryDelaySec
+            }
+            else {
+                Write-Error "All retry attempts failed. Stopping script."
+            }
+        }
+    }
+
+    # If all retries failed, stop the main loop.
+    if (-not $requestSuccess) {
+        break
+    }
+
+    # Validate the response structure before proceeding.
+    if ($null -eq $response -or -not $response.PSObject.Properties.Name.Contains('result')) {
+        Write-Warning "API response was invalid or did not contain a 'result' field. Stopping."
+        break
+    }
+
+    $results = $response.result
+
+    if (-not $results -or $results.Count -eq 0) {
+        Write-Host "No more records to fetch. Script finished."
+        break
+    }
+
+    Write-Host "Received $($results.Count) records in this batch. Processing..."
+
+    # Process the returned records to flatten nested objects.
+    $processedResults = foreach ($record in $results) {
+        $properties = [ordered]@{}
+        foreach ($property in $record.PSObject.Properties) {
+            $key = $property.Name
+            $value = $property.Value
+            $finalValue = $null
+
+            if ($value -is [System.Management.Automation.PSCustomObject] -and $value.PSObject.Properties.Name -contains 'display_value') {
+                $finalValue = $value.display_value
+            }
+            else {
+                $finalValue = $value
+            }
+
+            if ($finalValue -is [string]) {
+                $sanitizedValue = $finalValue -replace '[\r\n\t]+', ' '
+                $sanitizedValue = $sanitizedValue -replace '\s{2,}', ' '
+                $sanitizedValue = $sanitizedValue.Trim()
+
+                $maxCellLength = 32700
+                if ($key -eq 'description' -and $sanitizedValue.Length -gt $maxCellLength) {
+                    $sanitizedValue = $sanitizedValue.Substring(0, $maxCellLength) + " ... [TRUNCATED]"
+                }
+                
+                $properties[$key] = $sanitizedValue
+            }
+            else {
+                $properties[$key] = $finalValue
+            }
+        }
+        [PSCustomObject]$properties
+    }
+
+    # Export the processed data to the CSV file.
+    if ($isFirstBatch) {
+        $processedResults | Export-Csv -Path $CsvFile -NoTypeInformation -Force -Encoding UTF8
+        $isFirstBatch = $false
+    }
+    else {
+        $processedResults | Export-Csv -Path $CsvFile -NoTypeInformation -Append -Encoding UTF8
+    }
+
+    Write-Host "Successfully saved $($processedResults.Count) records to $CsvFile."
+
+    $Offset += $BatchSize
+    Start-Sleep -Seconds 2
+}
+
+# Clean up the plain text token from memory
+Remove-Variable PlainTextToken -ErrorAction SilentlyContinue
+
