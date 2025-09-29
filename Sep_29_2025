@@ -108,7 +108,15 @@ while ($true) {
     # --- Retry Loop ---
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         try {
-            $response = Invoke-RestMethod -Method Get -Uri $ApiEndpoint -Headers $Headers -Body $queryParams -ContentType "application/json" -ErrorAction Stop -TimeoutSec $RequestTimeoutSec
+            $apiResponseObject = Invoke-RestMethod -Method Get -Uri $ApiEndpoint -Headers $Headers -Body $queryParams -ContentType "application/json" -ErrorAction Stop -TimeoutSec $RequestTimeoutSec
+            
+            # Validate the response structure immediately. If it's invalid, throw an error to trigger the catch block.
+            if ($null -eq $apiResponseObject -or -not $apiResponseObject.PSObject.Properties.Name.Contains('result')) {
+                $errorDetails = ConvertTo-Json -InputObject $apiResponseObject -Depth 5 -Compress
+                throw "API response was invalid or did not contain a 'result' field. Response Body: $errorDetails"
+            }
+            
+            $response = $apiResponseObject
             $requestSuccess = $true
             break # Exit retry loop on success
         }
