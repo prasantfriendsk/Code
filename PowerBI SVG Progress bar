@@ -1,0 +1,29 @@
+ModernAnimatedMaterialProgressBar = 
+VAR ProgressValue = [AverageProgress] * 100
+VAR SVGWidth = 200
+VAR SVGHeight = 10
+VAR CornerRadius = SVGHeight / 2
+VAR PrimaryColor = 
+    SWITCH(
+        TRUE(),
+        ProgressValue < 33, "#D32F2F", // Red (Low progress)
+        ProgressValue < 66, "#FFC107", // Amber (Medium progress)
+        "#4CAF50" // Green (High progress)
+    )
+VAR SecondaryColor = "#90CAF9"
+VAR BackgroundColor = "#E0E0E0"
+VAR AnimatedWidth = ProgressValue * SVGWidth / 100
+VAR SVGString =
+    "<svg width='" & SVGWidth & "' height='" & SVGHeight & "' xmlns='http://www.w3.org/2000/svg'>" &
+    "<rect width='" & SVGWidth & "' height='" & SVGHeight & "' rx='" & CornerRadius & "' ry='" & CornerRadius & "' fill='" & BackgroundColor & "' />" &
+    "<rect width='" & AnimatedWidth & "' height='" & SVGHeight & "' rx='" & CornerRadius & "' ry='" & CornerRadius & "' fill='" & PrimaryColor & "'>" &
+    "<animate attributeName='width' from='0' to='" & AnimatedWidth & "' dur='1s' fill='freeze' />" &
+    "</rect>" &
+    "</svg>"
+VAR EncodedSVG =
+    "data:image/svg+xml;utf8," & SUBSTITUTE(
+        SVGString,
+        "#", "%23"
+    )
+RETURN
+    EncodedSVG
