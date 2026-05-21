@@ -1,33 +1,31 @@
 let
-    // Function to fetch Description using OData Feed
-    FetchWorkItemDescription = (workItemId as number) as text =>
+    FetchWorkItemDescription = (WorkItemId as number) as text =>
     let
-        Source = OData.Feed(
-            "https://analytics.dev.azure.com/daais-program-product-mgmt/AI%20Enablement%20Service%20Portfolio%20Management%20Backlog/_odata/v3.0-preview",
-            null,
-            [Implementation="2.0"]
-        ),
+        // Build OData URL
+        Source =
+            OData.Feed(
+                "https://analytics.dev.azure.com/{organization}/{project}/_odata/v3.0-preview/WorkItems?$filter=WorkItemId eq "
+                & Number.ToText(WorkItemId),
+                null,
+                [Implementation="2.0"]
+            ),
 
-        WorkItems = Source{[Name="WorkItems", Signature="table"]}[Data],
+        // Extract first row
+        FirstRow =
+            try Source{0} otherwise null,
 
-        // Filter specific work item
-        FilteredRow = Table.SelectRows(
-            WorkItems,
-            each [WorkItemId] = workItemId
-        ),
-
-        // Get Description safely
+        // Get description column
         DescriptionResult =
-            try FilteredRow{0}[Description]
-            otherwise "",
+            if FirstRow <> null
+            then Record.FieldOrDefault(FirstRow, "Description", "")
+            else "",
 
         Description =
-            if DescriptionResult = null
+            if DescriptionResult = null or DescriptionResult = ""
             then ""
             else DescriptionResult
 
     in
         Description
-
 in
     FetchWorkItemDescription
