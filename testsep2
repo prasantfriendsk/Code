@@ -1,31 +1,29 @@
-let
-    FetchWorkItemDescription = (WorkItemId as number) as text =>
-    let
-        // Build OData URL
-        Source =
-            OData.Feed(
-                "https://analytics.dev.azure.com/{organization}/{project}/_odata/v3.0-preview/WorkItems?$filter=WorkItemId eq "
-                & Number.ToText(WorkItemId),
-                null,
-                [Implementation="2.0"]
-            ),
+Closed Vulnerabilities by Remediation Timeframe
 
-        // Extract first row
-        FirstRow =
-            try Source{0} otherwise null,
+Description:
+Displays the number of vulnerabilities closed within and beyond the defined remediation SLA across different severity levels over the last 13 months. Green indicates vulnerabilities resolved within the target timeframe, while red represents closures after the SLA deadline.
 
-        // Get description column
-        DescriptionResult =
-            if FirstRow <> null
-            then Record.FieldOrDefault(FirstRow, "Description", "")
-            else "",
+Reopened Vulnerabilities by Risk Rating
 
-        Description =
-            if DescriptionResult = null or DescriptionResult = ""
-            then ""
-            else DescriptionResult
+Description:
+Shows the count of vulnerabilities that were reopened after closure, categorized by severity and remediation SLA. This helps identify recurring issues and potential gaps in remediation quality.
 
-    in
-        Description
-in
-    FetchWorkItemDescription
+Total Vulnerabilities Closed by Repository
+
+Description:
+Highlights repositories with the highest number of resolved vulnerabilities during the reporting period. Useful for identifying repositories with the most remediation activity.
+
+Closed Code Vulnerabilities – VP
+
+Description:
+Displays the total number of code vulnerabilities closed under each Vice President’s organization. Helps track remediation performance at the executive leadership level.
+
+Closed Code Vulnerabilities – Director
+
+Description:
+Shows vulnerability closure counts grouped by Directors, providing visibility into remediation efforts across different engineering or operational teams.
+
+Closed Code Vulnerabilities – Manager
+
+Description:
+Represents the number of vulnerabilities closed by managers and their respective teams, enabling operational-level tracking of remediation activities.
