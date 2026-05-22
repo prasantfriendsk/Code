@@ -1,29 +1,29 @@
-Closed Vulnerabilities by Remediation Timeframe
+xecutive-Friendly Description:
+Represents the total number of vulnerabilities remediated over the last 13 months, providing an overall view of remediation performance and security risk reduction trends.
 
-Description:
-Displays the number of vulnerabilities closed within and beyond the defined remediation SLA across different severity levels over the last 13 months. Green indicates vulnerabilities resolved within the target timeframe, while red represents closures after the SLA deadline.
+Power BI Info Button Text:
+Shows the total vulnerabilities closed during the last 13 months compared to the previous reporting period.
 
-Reopened Vulnerabilities by Risk Rating
+Total Closed Monthly
 
-Description:
-Shows the count of vulnerabilities that were reopened after closure, categorized by severity and remediation SLA. This helps identify recurring issues and potential gaps in remediation quality.
+Executive-Friendly Description:
+Displays the total vulnerabilities closed within the last 30 days, helping monitor monthly remediation throughput and operational efficiency.
 
-Total Vulnerabilities Closed by Repository
+Power BI Info Button Text:
+Shows vulnerabilities resolved in the last 30 days versus the prior month.
 
-Description:
-Highlights repositories with the highest number of resolved vulnerabilities during the reporting period. Useful for identifying repositories with the most remediation activity.
+Total Closed Monthly – Critical
 
-Closed Code Vulnerabilities – VP
+Executive-Friendly Description:
+Highlights the number of Critical severity vulnerabilities remediated in the last 30 days, enabling focused tracking of the highest-risk security issues.
 
-Description:
-Displays the total number of code vulnerabilities closed under each Vice President’s organization. Helps track remediation performance at the executive leadership level.
+Power BI Info Button Text:
+Displays Critical vulnerabilities closed in the last 30 days compared to the previous month.
 
-Closed Code Vulnerabilities – Director
+Total Closed Monthly – High
 
-Description:
-Shows vulnerability closure counts grouped by Directors, providing visibility into remediation efforts across different engineering or operational teams.
+Executive-Friendly Description:
+Tracks High severity vulnerabilities resolved during the last 30 days, supporting visibility into remediation progress for significant security risks.
 
-Closed Code Vulnerabilities – Manager
-
-Description:
-Represents the number of vulnerabilities closed by managers and their respective teams, enabling operational-level tracking of remediation activities.
+Power BI Info Button Text:
+Displays High severity vulnerabilities closed in the last 30 days versus the previous month.
