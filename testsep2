@@ -1,29 +1,22 @@
-xecutive-Friendly Description:
-Represents the total number of vulnerabilities remediated over the last 13 months, providing an overall view of remediation performance and security risk reduction trends.
+let
+    // Define the function with a parameter
+    FetchWorkItemDescription = (workItemId as number) as text =>
+    let
+        // OData Feed URL
+        Source = OData.Feed(
+            "https://dev.azure.com/daais-program-product-mgmt/AI%20Enablement%20Service%20Portfolio%20Management/_odata/v3.0-preview/WorkItems?$filter=WorkItemId eq " 
+            & Number.ToText(workItemId),
+            null,
+            [Implementation="2.0"]
+        ),
 
-Power BI Info Button Text:
-Shows the total vulnerabilities closed during the last 13 months compared to the previous reporting period.
+        // Extract Description column safely
+        DescriptionResult = try Source{0}[Description] otherwise "",
 
-Total Closed Monthly
+        // Return blank if null
+        Description = if DescriptionResult = null or DescriptionResult = "" then "" else DescriptionResult
 
-Executive-Friendly Description:
-Displays the total vulnerabilities closed within the last 30 days, helping monitor monthly remediation throughput and operational efficiency.
-
-Power BI Info Button Text:
-Shows vulnerabilities resolved in the last 30 days versus the prior month.
-
-Total Closed Monthly – Critical
-
-Executive-Friendly Description:
-Highlights the number of Critical severity vulnerabilities remediated in the last 30 days, enabling focused tracking of the highest-risk security issues.
-
-Power BI Info Button Text:
-Displays Critical vulnerabilities closed in the last 30 days compared to the previous month.
-
-Total Closed Monthly – High
-
-Executive-Friendly Description:
-Tracks High severity vulnerabilities resolved during the last 30 days, supporting visibility into remediation progress for significant security risks.
-
-Power BI Info Button Text:
-Displays High severity vulnerabilities closed in the last 30 days versus the previous month.
+    in
+        Description
+in
+    FetchWorkItemDescription
